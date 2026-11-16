@@ -1,0 +1,19 @@
+[package]
+name = "portico-jni"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+portico-core = { path = "../portico-core" }
+portico-proto = { path = "../portico-proto" }
+tokio.workspace = true
+rusb.workspace = true
+jni.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
