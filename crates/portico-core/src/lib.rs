@@ -1,5 +1,7 @@
 pub mod config;
 pub mod logging;
+pub mod registry;
+pub mod usb_handler;
 
 use thiserror::Error;
 
