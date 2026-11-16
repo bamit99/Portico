@@ -1,0 +1,26 @@
+[package]
+name = "portico-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "portico"
+path = "src/main.rs"
+
+[dependencies]
+portico-proto = { path = "../portico-proto" }
+portico-core = { path = "../portico-core" }
+portico-relay = { path = "../portico-relay" }
+tokio.workspace = true
+tokio-rustls.workspace = true
+clap.workspace = true
+rusb.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+usbip.workspace = true
