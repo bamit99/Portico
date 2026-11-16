@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Monochrome (themed icon) silhouette of the portico + USB connector -->
+    <path
+        android:pathData="M54,25 L80,42 L28,42 Z"
+        android:fillColor="#FFFFFFFF" />
+    <path
+        android:pathData="M30,42 H78 V46 H30 Z"
+        android:fillColor="#FFFFFFFF" />
+    <path
+        android:pathData="M37,74 V52 C37,47.6 38.8,46 41,46 C43.2,46 45,47.6 45,52 V74 Z"
+        android:fillColor="#FFFFFFFF" />
+    <path
+        android:pathData="M63,74 V52 C63,47.6 64.8,46 67,46 C69.2,46 71,47.6 71,52 V74 Z"
+        android:fillColor="#FFFFFFFF" />
+    <path
+        android:pathData="M32,74 H76 V78 H32 Z"
+        android:fillColor="#FFFFFFFF" />
+    <path
+        android:pathData="M48.5,80 H59.5 V86.5 H48.5 Z"
+        android:fillColor="#FFFFFFFF" />
+</vector>

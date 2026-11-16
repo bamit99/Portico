@@ -77,7 +77,7 @@ fun HelpDialog(onDismiss: () -> Unit) {
                     onClick = {
                         runCatching {
                             context.startActivity(
-                                Intent(Intent.ACTION_VIEW, Uri.parse("https://portico.local/docs")),
+                                Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/bamit99/Portico")),
                             )
                         }
                     },
@@ -99,7 +99,8 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 "Portico v${BuildConfig.VERSION_NAME}\n\n" +
                     "Clean-room root-free USB-over-network server with TLS 1.3, TOFU certificate pinning, " +
                     "mutual-TLS reverse clients, and ciphertext-only NAT relay.\n\n" +
-                    "Open-source core: jiegec/usbip (MIT), rusb (MIT), rustls (Apache-2.0/MIT).",
+                    "Open-source core: jiegec/usbip (MIT), rusb (MIT), rustls (Apache-2.0/MIT).\n\n" +
+                    "Project: https://github.com/bamit99/Portico",
                 style = MaterialTheme.typography.bodySmall,
             )
         },
