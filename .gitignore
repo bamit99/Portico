@@ -1,0 +1,11 @@
+target/
+.superpowers/
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+android/local.properties
+*.apk
+*.aab
+*.iml
+.DS_Store
