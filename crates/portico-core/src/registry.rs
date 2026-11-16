@@ -1,8 +1,10 @@
 use crate::config::VidPid;
+use crate::logging::DaemonEvent;
 use crate::CoreError;
 use portico_proto::frame::{DeviceSummary, TunnelStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::{broadcast, Notify};
 use usbip::{UsbDevice, UsbIpServer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,14 +66,22 @@ impl DeviceRecord {
     }
 }
 
+pub struct ClaimedDevice {
+    pub bus_id: String,
+    pub usbip_server: Arc<UsbIpServer>,
+    pub cancel: Arc<Notify>,
+}
+
 struct RegisteredEntry {
     record: DeviceRecord,
     usb_device: Option<UsbDevice>,
+    active_cancel: Option<Arc<Notify>>,
 }
 
 pub struct DeviceRegistry {
     usbip: Arc<UsbIpServer>,
     devices: tokio::sync::Mutex<HashMap<String, RegisteredEntry>>,
+    events_tx: Option<broadcast::Sender<DaemonEvent>>,
 }
 
 impl DeviceRegistry {
@@ -79,11 +89,26 @@ impl DeviceRegistry {
         Self {
             usbip: Arc::new(UsbIpServer::new_simulated(Vec::new())),
             devices: tokio::sync::Mutex::new(HashMap::new()),
+            events_tx: None,
+        }
+    }
+
+    pub fn with_events(events_tx: broadcast::Sender<DaemonEvent>) -> Self {
+        Self {
+            usbip: Arc::new(UsbIpServer::new_simulated(Vec::new())),
+            devices: tokio::sync::Mutex::new(HashMap::new()),
+            events_tx: Some(events_tx),
         }
     }
 
     pub fn usbip_server(&self) -> Arc<UsbIpServer> {
         self.usbip.clone()
+    }
+
+    fn emit(&self, ev: DaemonEvent) {
+        if let Some(tx) = &self.events_tx {
+            let _ = tx.send(ev);
+        }
     }
 
     fn is_ignored(vid: u16, pid: u16, ignored: &[VidPid]) -> bool {
@@ -114,24 +139,39 @@ impl DeviceRegistry {
             device_protocol: dev.device_protocol,
             speed: dev.speed,
             manufacturer,
-            product,
+            product: product.clone(),
             serial,
-            state,
+            state: state.clone(),
         };
 
-        // Replace existing entry if same bus_id re-registered
+        let mut guard = self.devices.lock().await;
+        if let Some(prev) = guard.remove(&bus_id) {
+            if let Some(cancel) = prev.active_cancel {
+                cancel.notify_waiters();
+            }
+        }
         let _ = self.usbip.remove_device(&bus_id).await;
         if !is_ign {
             self.usbip.add_device(dev.clone()).await;
         }
 
-        self.devices.lock().await.insert(
-            bus_id,
+        guard.insert(
+            bus_id.clone(),
             RegisteredEntry {
                 record: record.clone(),
                 usb_device: Some(dev),
+                active_cancel: None,
             },
         );
+        drop(guard);
+
+        self.emit(DaemonEvent::DeviceAdded {
+            bus_id,
+            vid: record.vid,
+            pid: record.pid,
+            product,
+            state: state.label().to_string(),
+        });
         Ok(record)
     }
 
@@ -151,17 +191,25 @@ impl DeviceRegistry {
             device_protocol: 0,
             speed: 0,
             manufacturer: String::new(),
-            product,
+            product: product.clone(),
             serial: String::new(),
             state: DeviceState::PendingPermission,
         };
         self.devices.lock().await.insert(
-            bus_id,
+            bus_id.clone(),
             RegisteredEntry {
                 record: record.clone(),
                 usb_device: None,
+                active_cancel: None,
             },
         );
+        self.emit(DaemonEvent::DeviceAdded {
+            bus_id,
+            vid,
+            pid,
+            product,
+            state: DeviceState::PendingPermission.label().to_string(),
+        });
         record
     }
 
@@ -170,29 +218,50 @@ impl DeviceRegistry {
         let Some(entry) = removed else {
             return Err(CoreError::NotFound(format!("device {bus_id} not found")));
         };
+        if let Some(cancel) = entry.active_cancel {
+            cancel.notify_waiters();
+        }
         let _ = self.usbip.remove_device(bus_id).await;
+        self.emit(DaemonEvent::DeviceRemoved {
+            bus_id: bus_id.to_string(),
+        });
         Ok(entry.record)
     }
 
     pub async fn apply_ignored_list(&self, ignored: &[VidPid]) -> Result<(), CoreError> {
-        let mut guard = self.devices.lock().await;
-        for entry in guard.values_mut() {
-            let should_ignore =
-                Self::is_ignored(entry.record.vid, entry.record.pid, ignored);
-            match (&entry.record.state, should_ignore) {
-                (DeviceState::Shared, true) => {
-                    if self.usbip.remove_device(&entry.record.bus_id).await.is_ok() {
+        let mut events = Vec::new();
+        {
+            let mut guard = self.devices.lock().await;
+            for entry in guard.values_mut() {
+                let should_ignore =
+                    Self::is_ignored(entry.record.vid, entry.record.pid, ignored);
+                match (&entry.record.state, should_ignore) {
+                    (DeviceState::Shared, true) => {
+                        let _ = self.usbip.remove_device(&entry.record.bus_id).await;
                         entry.record.state = DeviceState::Ignored;
+                        events.push(DaemonEvent::DeviceState {
+                            bus_id: entry.record.bus_id.clone(),
+                            state: "ignored".into(),
+                            peer: "-".into(),
+                        });
                     }
-                }
-                (DeviceState::Ignored, false) => {
-                    if let Some(dev) = entry.usb_device.as_ref() {
-                        self.usbip.add_device(dev.clone()).await;
-                        entry.record.state = DeviceState::Shared;
+                    (DeviceState::Ignored, false) => {
+                        if let Some(dev) = entry.usb_device.as_ref() {
+                            self.usbip.add_device(dev.clone()).await;
+                            entry.record.state = DeviceState::Shared;
+                            events.push(DaemonEvent::DeviceState {
+                                bus_id: entry.record.bus_id.clone(),
+                                state: "shared".into(),
+                                peer: "-".into(),
+                            });
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
+        }
+        for ev in events {
+            self.emit(ev);
         }
         Ok(())
     }
@@ -227,26 +296,64 @@ impl DeviceRegistry {
         }
     }
 
-    pub async fn mark_in_use(&self, bus_id: &str, peer: &str) {
+    pub async fn try_claim_device(
+        &self,
+        bus_id: &str,
+        peer: &str,
+    ) -> Result<ClaimedDevice, TunnelStatus> {
         let mut guard = self.devices.lock().await;
-        if let Some(entry) = guard.get_mut(bus_id) {
-            entry.record.state = DeviceState::InUse(peer.to_string());
+        let Some(entry) = guard.get_mut(bus_id) else {
+            return Err(TunnelStatus::NotFound);
+        };
+        match entry.record.state {
+            DeviceState::Shared => {}
+            DeviceState::InUse(_) => return Err(TunnelStatus::InUse),
+            DeviceState::Ignored | DeviceState::PendingPermission => {
+                return Err(TunnelStatus::Ignored);
+            }
         }
+        let Some(dev) = entry.usb_device.as_ref() else {
+            return Err(TunnelStatus::NotFound);
+        };
+        let tunnel_server = Arc::new(UsbIpServer::new_simulated(vec![dev.clone()]));
+        let cancel = Arc::new(Notify::new());
+        entry.record.state = DeviceState::InUse(peer.to_string());
+        entry.active_cancel = Some(cancel.clone());
+        drop(guard);
+
+        self.emit(DaemonEvent::DeviceState {
+            bus_id: bus_id.to_string(),
+            state: "in_use".into(),
+            peer: peer.to_string(),
+        });
+
+        Ok(ClaimedDevice {
+            bus_id: bus_id.to_string(),
+            usbip_server: tunnel_server,
+            cancel,
+        })
     }
 
-    pub async fn mark_released(&self, bus_id: &str, ignored: &[VidPid]) {
-        let mut guard = self.devices.lock().await;
-        if let Some(entry) = guard.get_mut(bus_id) {
+    pub async fn release_claim(&self, bus_id: &str, ignored: &[VidPid]) {
+        let ev = {
+            let mut guard = self.devices.lock().await;
+            let Some(entry) = guard.get_mut(bus_id) else {
+                return;
+            };
+            entry.active_cancel = None;
             if Self::is_ignored(entry.record.vid, entry.record.pid, ignored) {
-                if self.usbip.remove_device(bus_id).await.is_ok() {
-                    entry.record.state = DeviceState::Ignored;
-                    return;
-                }
-            }
-            if matches!(entry.record.state, DeviceState::InUse(_)) {
+                let _ = self.usbip.remove_device(bus_id).await;
+                entry.record.state = DeviceState::Ignored;
+            } else if matches!(entry.record.state, DeviceState::InUse(_)) {
                 entry.record.state = DeviceState::Shared;
             }
-        }
+            DaemonEvent::DeviceState {
+                bus_id: bus_id.to_string(),
+                state: entry.record.state.label().to_string(),
+                peer: "-".into(),
+            }
+        };
+        self.emit(ev);
     }
 }
 

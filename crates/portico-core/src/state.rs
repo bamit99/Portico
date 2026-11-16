@@ -57,7 +57,7 @@ impl DaemonState {
             data_dir,
             config: Mutex::new(store),
             identity: RwLock::new(identity),
-            registry: Arc::new(DeviceRegistry::new()),
+            registry: Arc::new(DeviceRegistry::with_events(events_tx.clone())),
             logs: Arc::new(LogRingBuffer::new(1000)),
             events_tx,
             server_running: AtomicBool::new(false),

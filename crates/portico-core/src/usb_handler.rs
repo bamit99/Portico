@@ -2,8 +2,8 @@ use crate::config::UsbSpeedSetting;
 use crate::CoreError;
 use rusb::{DeviceHandle, Direction as RusbDir, Speed, UsbContext};
 use std::any::Any;
-use std::io::{Error as IoError, Result as IoResult};
-use std::sync::{Arc, Mutex};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 use usbip::{
@@ -11,9 +11,33 @@ use usbip::{
     UsbInterface, UsbInterfaceHandler, UsbSpeed,
 };
 
+pub const MAX_USB_TRANSFER_LEN: u32 = 16 * 1024 * 1024;
+
+pub fn validate_in_transfer_len(len: u32) -> IoResult<usize> {
+    if len > MAX_USB_TRANSFER_LEN {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("transfer_buffer_length {len} exceeds cap {MAX_USB_TRANSFER_LEN}"),
+        ));
+    }
+    Ok(len as usize)
+}
+
+fn run_blocking_usb<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(f);
+        }
+    }
+    f()
+}
+
 #[derive(Clone)]
 pub struct PorticoRusbInterfaceHandler<C: UsbContext + 'static> {
-    handle: Arc<Mutex<DeviceHandle<C>>>,
+    handle: Arc<DeviceHandle<C>>,
 }
 
 impl<C: UsbContext + 'static> std::fmt::Debug for PorticoRusbInterfaceHandler<C> {
@@ -23,7 +47,7 @@ impl<C: UsbContext + 'static> std::fmt::Debug for PorticoRusbInterfaceHandler<C>
 }
 
 impl<C: UsbContext + 'static> PorticoRusbInterfaceHandler<C> {
-    pub fn new(handle: Arc<Mutex<DeviceHandle<C>>>) -> Self {
+    pub fn new(handle: Arc<DeviceHandle<C>>) -> Self {
         Self { handle }
     }
 }
@@ -43,7 +67,7 @@ fn map_rusb_out(res: rusb::Result<usize>) -> IoResult<Vec<u8>> {
     }
 }
 
-impl<C: UsbContext + Send + 'static> UsbInterfaceHandler for PorticoRusbInterfaceHandler<C> {
+impl<C: UsbContext + Send + Sync + 'static> UsbInterfaceHandler for PorticoRusbInterfaceHandler<C> {
     fn get_class_specific_descriptor(&self) -> Vec<u8> {
         Vec::new()
     }
@@ -56,16 +80,14 @@ impl<C: UsbContext + Send + 'static> UsbInterfaceHandler for PorticoRusbInterfac
         setup: SetupPacket,
         req: &[u8],
     ) -> IoResult<Vec<u8>> {
-        let mut buffer = vec![0u8; transfer_buffer_length as usize];
         let timeout = Duration::from_secs(1);
-        let handle = self
-            .handle
-            .lock()
-            .map_err(|_| IoError::other("usb handle mutex poisoned"))?;
+        let handle = &self.handle;
 
         if ep.attributes == EndpointAttributes::Control as u8 {
             if let Direction::In = ep.direction() {
-                map_rusb_res(
+                let len = validate_in_transfer_len(transfer_buffer_length)?;
+                let mut buffer = vec![0u8; len];
+                let res = run_blocking_usb(|| {
                     handle.read_control(
                         setup.request_type,
                         setup.request,
@@ -73,33 +95,41 @@ impl<C: UsbContext + Send + 'static> UsbInterfaceHandler for PorticoRusbInterfac
                         setup.index,
                         &mut buffer,
                         timeout,
-                    ),
-                    &buffer,
-                )
+                    )
+                });
+                map_rusb_res(res, &buffer)
             } else {
-                map_rusb_out(handle.write_control(
-                    setup.request_type,
-                    setup.request,
-                    setup.value,
-                    setup.index,
-                    req,
-                    timeout,
-                ))
+                let res = run_blocking_usb(|| {
+                    handle.write_control(
+                        setup.request_type,
+                        setup.request,
+                        setup.value,
+                        setup.index,
+                        req,
+                        timeout,
+                    )
+                });
+                map_rusb_out(res)
             }
         } else if ep.attributes == EndpointAttributes::Interrupt as u8 {
             if let Direction::In = ep.direction() {
-                map_rusb_res(
-                    handle.read_interrupt(ep.address, &mut buffer, timeout),
-                    &buffer,
-                )
+                let len = validate_in_transfer_len(transfer_buffer_length)?;
+                let mut buffer = vec![0u8; len];
+                let res = run_blocking_usb(|| handle.read_interrupt(ep.address, &mut buffer, timeout));
+                map_rusb_res(res, &buffer)
             } else {
-                map_rusb_out(handle.write_interrupt(ep.address, req, timeout))
+                let res = run_blocking_usb(|| handle.write_interrupt(ep.address, req, timeout));
+                map_rusb_out(res)
             }
         } else if ep.attributes == EndpointAttributes::Bulk as u8 {
             if let Direction::In = ep.direction() {
-                map_rusb_res(handle.read_bulk(ep.address, &mut buffer, timeout), &buffer)
+                let len = validate_in_transfer_len(transfer_buffer_length)?;
+                let mut buffer = vec![0u8; len];
+                let res = run_blocking_usb(|| handle.read_bulk(ep.address, &mut buffer, timeout));
+                map_rusb_res(res, &buffer)
             } else {
-                map_rusb_out(handle.write_bulk(ep.address, req, timeout))
+                let res = run_blocking_usb(|| handle.write_bulk(ep.address, req, timeout));
+                map_rusb_out(res)
             }
         } else {
             Ok(Vec::new())
@@ -113,7 +143,7 @@ impl<C: UsbContext + Send + 'static> UsbInterfaceHandler for PorticoRusbInterfac
 
 #[derive(Clone)]
 pub struct PorticoRusbDeviceHandler<C: UsbContext + 'static> {
-    handle: Arc<Mutex<DeviceHandle<C>>>,
+    handle: Arc<DeviceHandle<C>>,
 }
 
 impl<C: UsbContext + 'static> std::fmt::Debug for PorticoRusbDeviceHandler<C> {
@@ -123,36 +153,37 @@ impl<C: UsbContext + 'static> std::fmt::Debug for PorticoRusbDeviceHandler<C> {
 }
 
 impl<C: UsbContext + 'static> PorticoRusbDeviceHandler<C> {
-    pub fn new(handle: Arc<Mutex<DeviceHandle<C>>>) -> Self {
+    pub fn new(handle: Arc<DeviceHandle<C>>) -> Self {
         Self { handle }
     }
 }
 
-impl<C: UsbContext + Send + 'static> UsbDeviceHandler for PorticoRusbDeviceHandler<C> {
+impl<C: UsbContext + Send + Sync + 'static> UsbDeviceHandler for PorticoRusbDeviceHandler<C> {
     fn handle_urb(
         &mut self,
         transfer_buffer_length: u32,
         setup: SetupPacket,
         req: &[u8],
     ) -> IoResult<Vec<u8>> {
-        let mut buffer = vec![0u8; transfer_buffer_length as usize];
         let timeout = Duration::from_secs(1);
-        let handle = self
-            .handle
-            .lock()
-            .map_err(|_| IoError::other("usb handle mutex poisoned"))?;
+        let handle = &self.handle;
 
         if setup.request_type & 0x80 == 0 {
-            map_rusb_out(handle.write_control(
-                setup.request_type,
-                setup.request,
-                setup.value,
-                setup.index,
-                req,
-                timeout,
-            ))
+            let res = run_blocking_usb(|| {
+                handle.write_control(
+                    setup.request_type,
+                    setup.request,
+                    setup.value,
+                    setup.index,
+                    req,
+                    timeout,
+                )
+            });
+            map_rusb_out(res)
         } else {
-            map_rusb_res(
+            let len = validate_in_transfer_len(transfer_buffer_length)?;
+            let mut buffer = vec![0u8; len];
+            let res = run_blocking_usb(|| {
                 handle.read_control(
                     setup.request_type,
                     setup.request,
@@ -160,9 +191,9 @@ impl<C: UsbContext + Send + 'static> UsbDeviceHandler for PorticoRusbDeviceHandl
                     setup.index,
                     &mut buffer,
                     timeout,
-                ),
-                &buffer,
-            )
+                )
+            });
+            map_rusb_res(res, &buffer)
         }
     }
 
@@ -188,7 +219,7 @@ fn map_speed(speed: Speed, override_setting: UsbSpeedSetting) -> UsbSpeed {
     }
 }
 
-pub fn usb_device_from_rusb_handle<C: UsbContext + Send + 'static>(
+pub fn usb_device_from_rusb_handle<C: UsbContext + Send + Sync + 'static>(
     open_device: DeviceHandle<C>,
     bus_id: &str,
     bus_num: u32,
@@ -204,15 +235,12 @@ pub fn usb_device_from_rusb_handle<C: UsbContext + Send + 'static>(
         .active_config_descriptor()
         .map_err(|e| CoreError::Usb(format!("config descriptor: {e}")))?;
 
-    let handle = Arc::new(Mutex::new(open_device));
+    let handle = Arc::new(open_device);
 
-    {
-        let h = handle.lock().unwrap();
-        let _ = h.set_auto_detach_kernel_driver(true);
-        for intf in cfg.interfaces() {
-            if let Some(intf_desc) = intf.descriptors().next() {
-                let _ = h.claim_interface(intf_desc.interface_number());
-            }
+    let _ = handle.set_auto_detach_kernel_driver(true);
+    for intf in cfg.interfaces() {
+        if let Some(intf_desc) = intf.descriptors().next() {
+            let _ = handle.claim_interface(intf_desc.interface_number());
         }
     }
 
@@ -237,7 +265,7 @@ pub fn usb_device_from_rusb_handle<C: UsbContext + Send + 'static>(
     let mut serial = String::new();
 
     if let Some(idx) = desc.manufacturer_string_index() {
-        match handle.lock().unwrap().read_string_descriptor_ascii(idx) {
+        match handle.read_string_descriptor_ascii(idx) {
             Ok(s) => {
                 device.set_manufacturer_name(&s);
                 manufacturer = s;
@@ -249,7 +277,7 @@ pub fn usb_device_from_rusb_handle<C: UsbContext + Send + 'static>(
     }
 
     if let Some(idx) = desc.product_string_index() {
-        match handle.lock().unwrap().read_string_descriptor_ascii(idx) {
+        match handle.read_string_descriptor_ascii(idx) {
             Ok(s) => {
                 device.set_product_name(&s);
                 product = s;
@@ -264,7 +292,7 @@ pub fn usb_device_from_rusb_handle<C: UsbContext + Send + 'static>(
     }
 
     if let Some(idx) = desc.serial_number_string_index() {
-        match handle.lock().unwrap().read_string_descriptor_ascii(idx) {
+        match handle.read_string_descriptor_ascii(idx) {
             Ok(s) => {
                 device.set_serial_number(&s);
                 serial = s;
@@ -292,25 +320,27 @@ pub fn usb_device_from_rusb_handle<C: UsbContext + Send + 'static>(
                 interval: ep_desc.interval(),
             });
         }
-        let handler: Arc<Mutex<Box<dyn UsbInterfaceHandler + Send>>> =
-            Arc::new(Mutex::new(Box::new(PorticoRusbInterfaceHandler::new(
-                handle.clone(),
-            ))));
+        let intf_name = intf_desc
+            .description_string_index()
+            .and_then(|idx| handle.read_string_descriptor_ascii(idx).ok());
+        let handler: Arc<std::sync::Mutex<Box<dyn UsbInterfaceHandler + Send>>> =
+            Arc::new(std::sync::Mutex::new(Box::new(
+                PorticoRusbInterfaceHandler::new(handle.clone()),
+            )));
         device = device.with_interface(
             intf_desc.class_code(),
             intf_desc.sub_class_code(),
             intf_desc.protocol_code(),
-            None,
+            intf_name.as_deref(),
             endpoints,
             handler,
         );
         if let Some(last) = device.interfaces.last_mut() {
             last.class_specific_descriptor = Vec::from(intf_desc.extra());
-            last.string_interface = intf_desc.description_string_index().unwrap_or(0);
         }
     }
 
-    device = device.with_device_handler(Arc::new(Mutex::new(Box::new(
+    device = device.with_device_handler(Arc::new(std::sync::Mutex::new(Box::new(
         PorticoRusbDeviceHandler::new(handle),
     ))));
 

@@ -202,6 +202,70 @@ async fn valid_token_lists_and_upgrades_to_usbip_while_wrong_token_and_public_pl
     let mut dev_info = vec![0u8; 0x138];
     cli3.read_exact(&mut dev_info).await.unwrap();
 
+    // Verify a second shared device (1-3) CANNOT be imported through 1-1's tunnel
+    state
+        .registry
+        .register_usb_device(
+            make_sim_cdc("1-3", 0x9999, 0x8888),
+            "Other".into(),
+            "Dev".into(),
+            "S3".into(),
+            &ignored,
+        )
+        .await
+        .unwrap();
+    let (mut cli4, srv4) = tokio::io::duplex(65536);
+    let st4 = state.clone();
+    let h4 = tokio::spawn(async move { serve_portico_stream(srv4, lan_peer, true, st4).await });
+    write_frame(
+        &mut cli4,
+        &Frame::ClientHello {
+            min_ver: PROTOCOL_VERSION_V0,
+            max_ver: PROTOCOL_VERSION_V0,
+            auth_kind: AuthKind::ClaimToken,
+            credentials: token.as_bytes().to_vec(),
+            client_name: "attacker".into(),
+            capabilities: CAP_USBIP_V1,
+        },
+    )
+    .await
+    .unwrap();
+    let _ = read_frame(&mut cli4).await.unwrap();
+    write_frame(
+        &mut cli4,
+        &Frame::OpenTunnelReq {
+            bus_id: "1-3".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut cli4).await.unwrap(),
+        Frame::OpenTunnelResp {
+            status: TunnelStatus::Ok,
+            ..
+        }
+    ));
+    let mut try_1_1 = b"1-1".to_vec();
+    try_1_1.resize(32, 0);
+    cli4.write_all(
+        &UsbIpCommand::OpReqImport {
+            status: 0,
+            busid: try_1_1.try_into().unwrap(),
+        }
+        .to_bytes(),
+    )
+    .await
+    .unwrap();
+    let _v = cli4.read_u32().await.unwrap();
+    assert_ne!(
+        cli4.read_u32().await.unwrap(),
+        0,
+        "tunnel for 1-3 must NOT be able to import 1-1"
+    );
+    drop(cli4);
+    let _ = h4.await;
+
     // Send GetDescriptor(Device)
     let submit = UsbIpCommand::UsbIpCmdSubmit {
         header: usbip::usbip_protocol::UsbIpHeaderBasic {

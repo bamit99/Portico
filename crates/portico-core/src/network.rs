@@ -1,6 +1,6 @@
 use crate::config::LicenseTier;
 use crate::logging::{DaemonEvent, LogLevel};
-use crate::session::{serve_portico_stream, serve_reverse_data_stream};
+use crate::session::{serve_portico_stream_with_stop, serve_reverse_data_stream};
 use crate::state::{DaemonState, RelayStatus};
 use crate::CoreError;
 use portico_proto::discovery::DiscoveryPacket;
@@ -17,9 +17,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+fn extract_sni_host(addr: &str) -> String {
+    let raw = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    raw.trim_start_matches('[').trim_end_matches(']').to_string()
+}
 
 #[derive(Default)]
 pub struct NetworkSupervisor {
@@ -27,6 +32,7 @@ pub struct NetworkSupervisor {
     discovery_task: Mutex<Option<JoinHandle<()>>>,
     relay_task: Mutex<Option<JoinHandle<()>>>,
     reverse_tasks: Mutex<Vec<JoinHandle<()>>>,
+    session_stop: Mutex<Option<Arc<Notify>>>,
     bound_tcp_addr: Mutex<Option<SocketAddr>>,
     bound_udp_addr: Mutex<Option<SocketAddr>>,
 }
@@ -46,6 +52,9 @@ impl NetworkSupervisor {
             let udp = *self.bound_udp_addr.lock().await;
             return Ok((addr, udp));
         }
+
+        let stop_notify = Arc::new(Notify::new());
+        *self.session_stop.lock().await = Some(stop_notify.clone());
 
         let listener = TcpListener::bind(tcp_bind).await?;
         let local_tcp = listener.local_addr()?;
@@ -67,8 +76,9 @@ impl NetworkSupervisor {
         };
 
         let st = state.clone();
+        let tcp_stop = stop_notify.clone();
         let tcp_handle = tokio::spawn(async move {
-            run_tcp_accept_loop(listener, st).await;
+            run_tcp_accept_loop(listener, st, tcp_stop).await;
         });
         *self.tcp_task.lock().await = Some(tcp_handle);
 
@@ -90,6 +100,9 @@ impl NetworkSupervisor {
     }
 
     pub async fn stop_server(&self, state: &Arc<DaemonState>) {
+        if let Some(stop) = self.session_stop.lock().await.take() {
+            stop.notify_waiters();
+        }
         if let Some(h) = self.tcp_task.lock().await.take() {
             h.abort();
         }
@@ -142,8 +155,9 @@ impl NetworkSupervisor {
             address: String::new(),
         });
 
+        let stop_notify = self.session_stop.lock().await.clone();
         let handle = tokio::spawn(async move {
-            run_relay_loop(state, relay_cfg.endpoint, relay_cfg.slot_secret_hex).await;
+            run_relay_loop(state, relay_cfg.endpoint, relay_cfg.slot_secret_hex, stop_notify).await;
         });
         *self.relay_task.lock().await = Some(handle);
     }
@@ -156,11 +170,13 @@ impl NetworkSupervisor {
         if !state.server_running.load(Ordering::SeqCst) {
             return;
         }
+        let stop_notify = self.session_stop.lock().await.clone();
         let entries = state.config.lock().await.config.reverse_clients.clone();
         for entry in entries.into_iter().filter(|e| e.enabled) {
             let st = state.clone();
+            let stop = stop_notify.clone();
             tasks.push(tokio::spawn(async move {
-                run_reverse_client_loop(st, entry.addr, entry.cert_sha256).await;
+                run_reverse_client_loop(st, entry.addr, entry.cert_sha256, stop).await;
             }));
         }
     }
@@ -174,38 +190,48 @@ impl NetworkSupervisor {
     }
 }
 
-async fn run_tcp_accept_loop(listener: TcpListener, state: Arc<DaemonState>) {
+async fn run_tcp_accept_loop(
+    listener: TcpListener,
+    state: Arc<DaemonState>,
+    stop_notify: Arc<Notify>,
+) {
     loop {
         let Ok((socket, peer)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
         let st = state.clone();
+        let stop = stop_notify.clone();
         tokio::spawn(async move {
             let mut first = [0u8; 1];
-            if socket.peek(&mut first).await.is_err() {
+            let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_secs(10), socket.peek(&mut first)).await
+            else {
                 return;
-            }
+            };
             if first[0] == 0x16 {
                 let id = st.identity.read().await.clone();
                 let Ok(tls_cfg) = build_server_tls_config(&id, None) else {
                     return;
                 };
                 let acceptor = TlsAcceptor::from(tls_cfg);
-                match acceptor.accept(socket).await {
-                    Ok(tls_stream) => {
-                        let _ = serve_portico_stream(tls_stream, peer, true, st).await;
+                match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await {
+                    Ok(Ok(tls_stream)) => {
+                        let _ =
+                            serve_portico_stream_with_stop(tls_stream, peer, true, st, Some(stop))
+                                .await;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         st.log_and_emit(
                             LogLevel::Warn,
                             "tls",
                             &format!("TLS handshake failed from {peer}: {e}"),
                         );
                     }
+                    Err(_) => {}
                 }
             } else {
-                let _ = serve_portico_stream(socket, peer, false, st).await;
+                let _ = serve_portico_stream_with_stop(socket, peer, false, st, Some(stop)).await;
             }
         });
     }
@@ -242,92 +268,108 @@ async fn run_discovery_loop(sock: UdpSocket, state: Arc<DaemonState>, tcp_port: 
     }
 }
 
-async fn run_relay_loop(state: Arc<DaemonState>, endpoint: String, slot_secret_hex: String) {
-    let secret_bytes = hex::decode(&slot_secret_hex).unwrap_or_else(|_| slot_secret_hex.into_bytes());
+async fn run_relay_loop(
+    state: Arc<DaemonState>,
+    endpoint: String,
+    slot_secret_hex: String,
+    stop_notify: Option<Arc<Notify>>,
+) {
+    let secret_bytes =
+        hex::decode(&slot_secret_hex).unwrap_or_else(|_| slot_secret_hex.into_bytes());
     let secret_hash = hash_slot_secret(&secret_bytes);
 
     let mut backoff = Duration::from_secs(1);
     loop {
         let node_id = state.identity.read().await.node_id();
-        match TcpStream::connect(&endpoint).await {
+        let err_msg: String = match TcpStream::connect(&endpoint).await {
             Ok(mut ctrl) => {
                 let reg = RelayFrame::ControlRegister {
                     node_id,
                     slot_secret_hash: secret_hash,
                 };
-                if reg.write_to(&mut ctrl).await.is_err() {
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                match RelayFrame::read_from(&mut ctrl).await {
-                    Ok(RelayFrame::Registered) => {
-                        backoff = Duration::from_secs(1);
-                        let uri = format_relay_uri(&endpoint, &node_id);
-                        *state.relay_status.write().await = RelayStatus::Ready(uri.clone());
-                        state.emit(DaemonEvent::RelayState {
-                            status: "ready".into(),
-                            address: uri,
-                        });
-                    }
-                    Ok(RelayFrame::RegisterRejected) | Err(_) => {
-                        *state.relay_status.write().await =
-                            RelayStatus::Error("relay registration rejected".into());
-                        state.emit(DaemonEvent::RelayState {
-                            status: "error".into(),
-                            address: String::new(),
-                        });
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
-                        continue;
-                    }
-                    _ => continue,
-                }
+                if let Err(e) = reg.write_to(&mut ctrl).await {
+                    e.to_string()
+                } else {
+                    match RelayFrame::read_from(&mut ctrl).await {
+                        Ok(RelayFrame::Registered) => {
+                            backoff = Duration::from_secs(1);
+                            let uri = format_relay_uri(&endpoint, &node_id);
+                            *state.relay_status.write().await = RelayStatus::Ready(uri.clone());
+                            state.emit(DaemonEvent::RelayState {
+                                status: "ready".into(),
+                                address: uri,
+                            });
 
-                while let Ok(RelayFrame::IncomingClient { conn_nonce }) =
-                    RelayFrame::read_from(&mut ctrl).await
-                {
-                    let ep = endpoint.clone();
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        let Ok(mut data) = TcpStream::connect(&ep).await else {
-                            return;
-                        };
-                        let peer = data
-                            .peer_addr()
-                            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-                        let accept = RelayFrame::ServerAccept {
-                            node_id,
-                            slot_secret_hash: secret_hash,
-                            conn_nonce,
-                        };
-                        if accept.write_to(&mut data).await.is_err() {
-                            return;
+                            loop {
+                                match RelayFrame::read_from(&mut ctrl).await {
+                                    Ok(RelayFrame::IncomingClient { conn_nonce }) => {
+                                        let ep = endpoint.clone();
+                                        let st = state.clone();
+                                        let stop = stop_notify.clone();
+                                        tokio::spawn(async move {
+                                            let Ok(mut data) = TcpStream::connect(&ep).await else {
+                                                return;
+                                            };
+                                            let peer = data.peer_addr().unwrap_or_else(|_| {
+                                                SocketAddr::from(([0, 0, 0, 0], 0))
+                                            });
+                                            let accept = RelayFrame::ServerAccept {
+                                                node_id,
+                                                slot_secret_hash: secret_hash,
+                                                conn_nonce,
+                                            };
+                                            if accept.write_to(&mut data).await.is_err() {
+                                                return;
+                                            }
+                                            let id = st.identity.read().await.clone();
+                                            let Ok(tls_cfg) = build_server_tls_config(&id, None)
+                                            else {
+                                                return;
+                                            };
+                                            let acceptor = TlsAcceptor::from(tls_cfg);
+                                            if let Ok(tls_stream) = acceptor.accept(data).await {
+                                                let _ = serve_portico_stream_with_stop(
+                                                    tls_stream,
+                                                    peer,
+                                                    true,
+                                                    st,
+                                                    stop,
+                                                )
+                                                .await;
+                                            }
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => break e.to_string(),
+                                }
+                            }
                         }
-                        let id = st.identity.read().await.clone();
-                        let Ok(tls_cfg) = build_server_tls_config(&id, None) else {
-                            return;
-                        };
-                        let acceptor = TlsAcceptor::from(tls_cfg);
-                        if let Ok(tls_stream) = acceptor.accept(data).await {
-                            let _ = serve_portico_stream(tls_stream, peer, true, st).await;
-                        }
-                    });
+                        Ok(RelayFrame::RegisterRejected) => "relay registration rejected".into(),
+                        Ok(_) => "unexpected relay registration response".into(),
+                        Err(e) => e.to_string(),
+                    }
                 }
             }
-            Err(e) => {
-                *state.relay_status.write().await = RelayStatus::Error(e.to_string());
-                state.emit(DaemonEvent::RelayState {
-                    status: "error".into(),
-                    address: String::new(),
-                });
-            }
-        }
+            Err(e) => e.to_string(),
+        };
+
+        *state.relay_status.write().await = RelayStatus::Error(err_msg);
+        state.emit(DaemonEvent::RelayState {
+            status: "error".into(),
+            address: String::new(),
+        });
+
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
-async fn run_reverse_client_loop(state: Arc<DaemonState>, addr: String, pinned_fp: String) {
+async fn run_reverse_client_loop(
+    state: Arc<DaemonState>,
+    addr: String,
+    pinned_fp: String,
+    stop_notify: Option<Arc<Notify>>,
+) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let id = state.identity.read().await.clone();
@@ -341,8 +383,13 @@ async fn run_reverse_client_loop(state: Arc<DaemonState>, addr: String, pinned_f
             return;
         };
         let connector = TlsConnector::from(cli_cfg);
-        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("localhost");
-        let Ok(server_name) = host.to_string().try_into() else {
+        let host = extract_sni_host(&addr);
+        let Ok(server_name) = host.try_into() else {
+            state.log_and_emit(
+                LogLevel::Warn,
+                "reverse",
+                &format!("invalid reverse client SNI host for '{addr}'"),
+            );
             return;
         };
 
@@ -352,12 +399,15 @@ async fn run_reverse_client_loop(state: Arc<DaemonState>, addr: String, pinned_f
                 .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
             if let Ok(mut tls) = connector.connect(server_name, tcp).await {
                 backoff = Duration::from_secs(1);
-                if handle_reverse_control_stream(&mut tls, peer, &addr, &pinned_fp, state.clone())
-                    .await
-                    .is_ok()
-                {
-                    // Clean disconnect
-                }
+                let _ = handle_reverse_control_stream(
+                    &mut tls,
+                    peer,
+                    &addr,
+                    &pinned_fp,
+                    state.clone(),
+                    stop_notify.clone(),
+                )
+                .await;
             }
         }
 
@@ -372,6 +422,7 @@ async fn handle_reverse_control_stream<S>(
     addr: &str,
     pinned_fp: &str,
     state: Arc<DaemonState>,
+    stop_notify: Option<Arc<Notify>>,
 ) -> Result<(), CoreError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -463,6 +514,7 @@ where
                 let st = state.clone();
                 let addr_owned = addr.to_string();
                 let fp_owned = pinned_fp.to_string();
+                let stop = stop_notify.clone();
                 tokio::spawn(async move {
                     let id = st.identity.read().await.clone();
                     let Ok((cli_cfg, _)) = build_client_tls_config(
@@ -474,11 +526,8 @@ where
                     ) else {
                         return;
                     };
-                    let host = addr_owned
-                        .rsplit_once(':')
-                        .map(|(h, _)| h)
-                        .unwrap_or("localhost");
-                    let Ok(sni) = host.to_string().try_into() else {
+                    let host = extract_sni_host(&addr_owned);
+                    let Ok(sni) = host.try_into() else {
                         return;
                     };
                     let Ok(tcp) = TcpStream::connect(&addr_owned).await else {
@@ -488,7 +537,15 @@ where
                         .peer_addr()
                         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
                     if let Ok(tls) = TlsConnector::from(cli_cfg).connect(sni, tcp).await {
-                        let _ = serve_reverse_data_stream(tls, peer, &bus_id, conn_nonce, st).await;
+                        let _ = serve_reverse_data_stream(
+                            tls,
+                            peer,
+                            &bus_id,
+                            conn_nonce,
+                            st,
+                            stop,
+                        )
+                        .await;
                     }
                 });
             }

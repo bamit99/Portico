@@ -1,5 +1,6 @@
 use portico_core::config::VidPid;
 use portico_core::registry::{DeviceRegistry, DeviceState};
+use portico_core::usb_handler::{validate_in_transfer_len, MAX_USB_TRANSFER_LEN};
 use portico_core::CoreError;
 use portico_proto::frame::TunnelStatus;
 use std::sync::{Arc, Mutex};
@@ -87,10 +88,28 @@ async fn ignored_devices_never_auto_shared_and_toggle_updates_usbip_server() {
         Err(CoreError::NotFound(_))
     ));
 
-    // Detach 1-1 succeeds
-    reg.detach_device("1-1").await.unwrap();
+    // Concurrent claim exclusion + cross-device isolation + detach while InUse
+    let d3 = make_sim_cdc("1-3", 0xAAAA, 0xBBBB);
+    reg.register_usb_device(d3, "M".into(), "P".into(), "S3".into(), &[])
+        .await
+        .unwrap();
+    let claim1 = reg.try_claim_device("1-3", "peerA").await.unwrap();
     assert_eq!(
-        reg.check_tunnel_eligible("1-1").await,
-        Err(TunnelStatus::NotFound)
+        reg.try_claim_device("1-3", "peerB").await.err(),
+        Some(TunnelStatus::InUse)
     );
+    // Detach while InUse triggers cancel token and removes device
+    let notified = claim1.cancel.clone();
+    let waiter = tokio::spawn(async move { notified.notified().await });
+    tokio::task::yield_now().await;
+    reg.detach_device("1-3").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("cancel notify must fire on detach")
+        .unwrap();
+    assert!(reg.list_devices().await.iter().all(|d| d.bus_id != "1-3"));
+
+    assert_eq!(validate_in_transfer_len(1024).unwrap(), 1024);
+    assert!(validate_in_transfer_len(MAX_USB_TRANSFER_LEN + 1).is_err());
+    assert!(validate_in_transfer_len(u32::MAX).is_err());
 }

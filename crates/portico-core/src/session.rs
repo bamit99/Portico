@@ -1,5 +1,5 @@
 use crate::config::LicenseTier;
-use crate::logging::{DaemonEvent, LogLevel};
+use crate::logging::LogLevel;
 use crate::state::DaemonState;
 use crate::CoreError;
 use portico_proto::frame::{
@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Notify;
 
 struct PeerGuard {
     state: Arc<DaemonState>,
@@ -37,7 +38,7 @@ fn map_tier(tier: LicenseTier) -> ProtoTier {
 }
 
 pub async fn serve_portico_stream<S>(
-    mut stream: S,
+    stream: S,
     peer_addr: SocketAddr,
     is_tls: bool,
     state: Arc<DaemonState>,
@@ -45,11 +46,30 @@ pub async fn serve_portico_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    serve_portico_stream_with_stop(stream, peer_addr, is_tls, state, None).await
+}
+
+pub async fn serve_portico_stream_with_stop<S>(
+    mut stream: S,
+    peer_addr: SocketAddr,
+    is_tls: bool,
+    state: Arc<DaemonState>,
+    stop_notify: Option<Arc<Notify>>,
+) -> Result<(), CoreError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let _guard = PeerGuard::enter(state.clone());
 
-    let hello = match read_frame(&mut stream).await {
-        Ok(f) => f,
-        Err(e) => return Err(e.into()),
+    let hello = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_frame(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()),
     };
 
     let Frame::ClientHello {
@@ -164,14 +184,29 @@ where
     .await?;
 
     loop {
-        let frame = match read_frame(&mut stream).await {
-            Ok(f) => f,
-            Err(portico_proto::ProtoError::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                return Ok(());
+        let frame = if let Some(ref stop) = stop_notify {
+            tokio::select! {
+                _ = stop.notified() => return Ok(()),
+                r = read_frame(&mut stream) => match r {
+                    Ok(f) => f,
+                    Err(portico_proto::ProtoError::Io(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
-            Err(e) => return Err(e.into()),
+        } else {
+            match read_frame(&mut stream).await {
+                Ok(f) => f,
+                Err(portico_proto::ProtoError::Io(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            }
         };
 
         match frame {
@@ -183,40 +218,33 @@ where
                 write_frame(&mut stream, &Frame::Pong { nonce }).await?;
             }
             Frame::OpenTunnelReq { bus_id } => {
-                match state.registry.check_tunnel_eligible(&bus_id).await {
-                    Ok(()) => {
-                        write_frame(
+                let peer_label = format!("{client_name}@{peer_addr}");
+                match state.registry.try_claim_device(&bus_id, &peer_label).await {
+                    Ok(claim) => {
+                        if let Err(e) = write_frame(
                             &mut stream,
                             &Frame::OpenTunnelResp {
                                 status: TunnelStatus::Ok,
                                 message: String::new(),
                             },
                         )
-                        .await?;
-                        let peer_label = format!("{client_name}@{peer_addr}");
-                        state.registry.mark_in_use(&bus_id, &peer_label).await;
-                        state.emit(DaemonEvent::DeviceState {
-                            bus_id: bus_id.clone(),
-                            state: "in_use".into(),
-                            peer: peer_label,
-                        });
-                        let res = usbip::handler(&mut stream, state.registry.usbip_server()).await;
+                        .await
+                        {
+                            let ignored = state.config.lock().await.config.ignored_devices.clone();
+                            state.registry.release_claim(&bus_id, &ignored).await;
+                            return Err(e.into());
+                        }
+
+                        let res = run_tunnel_with_cancel(
+                            &mut stream,
+                            claim.usbip_server,
+                            claim.cancel,
+                            stop_notify.clone(),
+                        )
+                        .await;
                         let ignored = state.config.lock().await.config.ignored_devices.clone();
-                        state.registry.mark_released(&bus_id, &ignored).await;
-                        let final_state = state
-                            .registry
-                            .list_devices()
-                            .await
-                            .into_iter()
-                            .find(|d| d.bus_id == bus_id)
-                            .map(|d| d.state.label().to_string())
-                            .unwrap_or_else(|| "detached".into());
-                        state.emit(DaemonEvent::DeviceState {
-                            bus_id,
-                            state: final_state,
-                            peer: "-".into(),
-                        });
-                        return res.map_err(CoreError::Io);
+                        state.registry.release_claim(&bus_id, &ignored).await;
+                        return res;
                     }
                     Err(status) => {
                         let msg = match status {
@@ -251,52 +279,46 @@ where
 }
 
 pub async fn serve_reverse_data_stream<S>(
-    mut stream: S,
+    stream: S,
     peer_addr: SocketAddr,
     bus_id: &str,
     conn_nonce: [u8; 16],
     state: Arc<DaemonState>,
+    stop_notify: Option<Arc<Notify>>,
 ) -> Result<(), CoreError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut stream = stream;
     let _guard = PeerGuard::enter(state.clone());
     write_frame(&mut stream, &Frame::ReverseDataHello { conn_nonce }).await?;
 
-    match state.registry.check_tunnel_eligible(bus_id).await {
-        Ok(()) => {
-            write_frame(
+    let peer_label = format!("reverse@{peer_addr}");
+    match state.registry.try_claim_device(bus_id, &peer_label).await {
+        Ok(claim) => {
+            if let Err(e) = write_frame(
                 &mut stream,
                 &Frame::OpenTunnelResp {
                     status: TunnelStatus::Ok,
                     message: String::new(),
                 },
             )
-            .await?;
-            let peer_label = format!("reverse@{peer_addr}");
-            state.registry.mark_in_use(bus_id, &peer_label).await;
-            state.emit(DaemonEvent::DeviceState {
-                bus_id: bus_id.to_string(),
-                state: "in_use".into(),
-                peer: peer_label,
-            });
-            let res = usbip::handler(&mut stream, state.registry.usbip_server()).await;
+            .await
+            {
+                let ignored = state.config.lock().await.config.ignored_devices.clone();
+                state.registry.release_claim(bus_id, &ignored).await;
+                return Err(e.into());
+            }
+            let res = run_tunnel_with_cancel(
+                &mut stream,
+                claim.usbip_server,
+                claim.cancel,
+                stop_notify,
+            )
+            .await;
             let ignored = state.config.lock().await.config.ignored_devices.clone();
-            state.registry.mark_released(bus_id, &ignored).await;
-            let final_state = state
-                .registry
-                .list_devices()
-                .await
-                .into_iter()
-                .find(|d| d.bus_id == bus_id)
-                .map(|d| d.state.label().to_string())
-                .unwrap_or_else(|| "detached".into());
-            state.emit(DaemonEvent::DeviceState {
-                bus_id: bus_id.to_string(),
-                state: final_state,
-                peer: "-".into(),
-            });
-            res.map_err(CoreError::Io)
+            state.registry.release_claim(bus_id, &ignored).await;
+            res
         }
         Err(status) => {
             write_frame(
@@ -308,6 +330,29 @@ where
             )
             .await?;
             Ok(())
+        }
+    }
+}
+
+async fn run_tunnel_with_cancel<S>(
+    stream: &mut S,
+    usbip_server: Arc<usbip::UsbIpServer>,
+    claim_cancel: Arc<Notify>,
+    stop_notify: Option<Arc<Notify>>,
+) -> Result<(), CoreError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Some(stop) = stop_notify {
+        tokio::select! {
+            _ = claim_cancel.notified() => Ok(()),
+            _ = stop.notified() => Ok(()),
+            r = usbip::handler(stream, usbip_server) => r.map_err(CoreError::Io),
+        }
+    } else {
+        tokio::select! {
+            _ = claim_cancel.notified() => Ok(()),
+            r = usbip::handler(stream, usbip_server) => r.map_err(CoreError::Io),
         }
     }
 }

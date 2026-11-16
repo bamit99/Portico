@@ -1,4 +1,4 @@
-use crate::config::{ReverseClientEntry, UsbSpeedSetting, VidPid};
+use crate::config::{ConfigStore, ReverseClientEntry, UsbSpeedSetting, VidPid};
 use crate::control::spawn_control_server;
 use crate::logging::{pct_encode, DaemonEvent, LogLevel};
 use crate::network::NetworkSupervisor;
@@ -31,6 +31,21 @@ fn parse_bool(s: &str) -> Result<bool, String> {
     }
 }
 
+fn save_cloned_config(
+    guard: &mut ConfigStore,
+    mutate: impl FnOnce(&mut crate::config::DaemonConfig),
+) -> Result<(), CoreError> {
+    let mut candidate = guard.config.clone();
+    mutate(&mut candidate);
+    let tmp_store = ConfigStore {
+        path: guard.path.clone(),
+        config: candidate.clone(),
+    };
+    tmp_store.save_atomic()?;
+    guard.config = candidate;
+    Ok(())
+}
+
 impl DaemonHandle {
     pub async fn exec_command(&self, line: &str) -> String {
         let trimmed = line.trim();
@@ -44,10 +59,7 @@ impl DaemonHandle {
         match cmd.as_str() {
             "REGISTER_CLIENT" => {
                 let name = if rest.is_empty() { "client" } else { rest };
-                let id = format!(
-                    "cli-{}",
-                    rand::random::<u32>()
-                );
+                let id = format!("cli-{}", rand::random::<u32>());
                 self.state
                     .registered_clients
                     .lock()
@@ -62,7 +74,7 @@ impl DaemonHandle {
             }
             "UNREGISTER_CLIENT" => {
                 self.state.registered_clients.lock().await.remove(rest);
-                format!("OK")
+                "OK".into()
             }
             "GET_STATE" => {
                 let running = self.state.server_running.load(Ordering::SeqCst);
@@ -95,26 +107,35 @@ impl DaemonHandle {
                 let key = kv.next().unwrap_or("");
                 let val = kv.next().unwrap_or("").trim();
                 let mut cfg_guard = self.state.config.lock().await;
-                let res = match key {
+                let res: Result<(), String> = match key {
                     "port" => match val.parse::<u16>() {
                         Ok(p) if p > 0 => {
-                            cfg_guard.config.port = p;
-                            Ok(())
+                            save_cloned_config(&mut cfg_guard, |c| c.port = p)
+                                .map_err(|e| e.to_string())
                         }
                         _ => Err("invalid port".into()),
                     },
-                    "plaintext_lan" => parse_bool(val).map(|b| cfg_guard.config.plaintext_lan = b),
-                    "tls_required" => parse_bool(val).map(|b| cfg_guard.config.tls_required = b),
-                    "start_on_boot" => parse_bool(val).map(|b| cfg_guard.config.start_on_boot = b),
+                    "plaintext_lan" => match parse_bool(val) {
+                        Ok(b) => save_cloned_config(&mut cfg_guard, |c| c.plaintext_lan = b)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    },
+                    "tls_required" => match parse_bool(val) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            return "ERR policy_locked tls_required%20cannot%20be%20disabled".into();
+                        }
+                        Err(e) => Err(e),
+                    },
+                    "start_on_boot" => match parse_bool(val) {
+                        Ok(b) => save_cloned_config(&mut cfg_guard, |c| c.start_on_boot = b)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    },
                     _ => Err(format!("unknown state key '{key}'")),
                 };
                 match res {
-                    Ok(()) => {
-                        if let Err(e) = cfg_guard.save_atomic() {
-                            return format!("ERR save_failed {}", pct_encode(&e.to_string()));
-                        }
-                        "OK".into()
-                    }
+                    Ok(()) => "OK".into(),
                     Err(msg) => format!("ERR invalid_arg {}", pct_encode(&msg)),
                 }
             }
@@ -158,12 +179,15 @@ impl DaemonHandle {
                 };
                 let new_list = match parsed {
                     Ok(v) => v,
-                    Err(e) => return format!("ERR invalid_vid_pid {}", pct_encode(&e.to_string())),
+                    Err(e) => {
+                        return format!("ERR invalid_vid_pid {}", pct_encode(&e.to_string()))
+                    }
                 };
                 {
                     let mut cfg = self.state.config.lock().await;
-                    cfg.config.ignored_devices = new_list.clone();
-                    if let Err(e) = cfg.save_atomic() {
+                    if let Err(e) =
+                        save_cloned_config(&mut cfg, |c| c.ignored_devices = new_list.clone())
+                    {
                         return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                     }
                 }
@@ -228,8 +252,9 @@ impl DaemonHandle {
                 };
                 {
                     let mut cfg = self.state.config.lock().await;
-                    cfg.config.reverse_clients = new_list.clone();
-                    if let Err(e) = cfg.save_atomic() {
+                    if let Err(e) =
+                        save_cloned_config(&mut cfg, |c| c.reverse_clients = new_list.clone())
+                    {
                         return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                     }
                 }
@@ -251,14 +276,16 @@ impl DaemonHandle {
                 let ep_arg = sp.next().map(str::trim).filter(|s| !s.is_empty());
                 {
                     let mut cfg = self.state.config.lock().await;
-                    if let Some(ep) = ep_arg {
-                        cfg.config.relay.endpoint = ep.to_string();
-                    }
-                    if enabled && cfg.config.relay.endpoint.trim().is_empty() {
+                    let effective_ep = ep_arg
+                        .map(str::to_string)
+                        .unwrap_or_else(|| cfg.config.relay.endpoint.clone());
+                    if enabled && effective_ep.trim().is_empty() {
                         return "ERR invalid_relay relay%20endpoint%20is%20required".into();
                     }
-                    cfg.config.relay.enabled = enabled;
-                    if let Err(e) = cfg.save_atomic() {
+                    if let Err(e) = save_cloned_config(&mut cfg, |c| {
+                        c.relay.endpoint = effective_ep;
+                        c.relay.enabled = enabled;
+                    }) {
                         return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                     }
                 }
@@ -288,8 +315,9 @@ impl DaemonHandle {
                 Ok(b) => {
                     let wake = {
                         let mut cfg = self.state.config.lock().await;
-                        cfg.config.keep_network_awake = b;
-                        if let Err(e) = cfg.save_atomic() {
+                        if let Err(e) =
+                            save_cloned_config(&mut cfg, |c| c.keep_network_awake = b)
+                        {
                             return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                         }
                         cfg.config.keep_device_awake
@@ -306,8 +334,9 @@ impl DaemonHandle {
                 Ok(b) => {
                     let net = {
                         let mut cfg = self.state.config.lock().await;
-                        cfg.config.keep_device_awake = b;
-                        if let Err(e) = cfg.save_atomic() {
+                        if let Err(e) =
+                            save_cloned_config(&mut cfg, |c| c.keep_device_awake = b)
+                        {
                             return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                         }
                         cfg.config.keep_network_awake
@@ -323,8 +352,7 @@ impl DaemonHandle {
             "SET_SPEED" => match UsbSpeedSetting::parse(rest) {
                 Ok(sp) => {
                     let mut cfg = self.state.config.lock().await;
-                    cfg.config.usb_speed = sp;
-                    if let Err(e) = cfg.save_atomic() {
+                    if let Err(e) = save_cloned_config(&mut cfg, |c| c.usb_speed = sp) {
                         return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                     }
                     "OK".into()
@@ -351,12 +379,7 @@ impl DaemonHandle {
                 out.join("\n")
             }
             "DETACH_DEVICE" => match self.state.registry.detach_device(rest).await {
-                Ok(_) => {
-                    self.state.emit(DaemonEvent::DeviceRemoved {
-                        bus_id: rest.to_string(),
-                    });
-                    "OK".into()
-                }
+                Ok(_) => "OK".into(),
                 Err(e) => format!("ERR not_found {}", pct_encode(&e.to_string())),
             },
             "GET_TOKEN" => {
@@ -366,8 +389,7 @@ impl DaemonHandle {
             "REGEN_TOKEN" => {
                 let new_tok = generate_claim_token();
                 let mut cfg = self.state.config.lock().await;
-                cfg.config.claim_token = new_tok.clone();
-                if let Err(e) = cfg.save_atomic() {
+                if let Err(e) = save_cloned_config(&mut cfg, |c| c.claim_token = new_tok.clone()) {
                     return format!("ERR save_failed {}", pct_encode(&e.to_string()));
                 }
                 drop(cfg);
@@ -375,27 +397,31 @@ impl DaemonHandle {
                     .log_and_emit(LogLevel::Info, "security", "claim token regenerated");
                 format!("OK {new_tok}")
             }
-            "ROTATE_IDENTITY" => match NodeIdentity::generate("portico-node") {
-                Ok(new_id) => {
-                    let cert_path = self.state.data_dir.join("identity_cert.der");
-                    let key_path = self.state.data_dir.join("identity_key.der");
-                    if let Err(e) = write_atomic_secure(&cert_path, &new_id.cert_der)
-                        .and_then(|_| write_atomic_secure(&key_path, &new_id.key_der))
-                    {
-                        return format!("ERR save_failed {}", pct_encode(&e.to_string()));
+            "ROTATE_IDENTITY" => {
+                let mut id_guard = self.state.identity.write().await;
+                match NodeIdentity::generate("portico-node") {
+                    Ok(new_id) => {
+                        let cert_path = self.state.data_dir.join("identity_cert.der");
+                        let key_path = self.state.data_dir.join("identity_key.der");
+                        if let Err(e) = write_atomic_secure(&cert_path, &new_id.cert_der)
+                            .and_then(|_| write_atomic_secure(&key_path, &new_id.key_der))
+                        {
+                            return format!("ERR save_failed {}", pct_encode(&e.to_string()));
+                        }
+                        let fp = new_id.fingerprint_hex();
+                        *id_guard = new_id;
+                        drop(id_guard);
+                        self.network.sync_relay(self.state.clone()).await;
+                        self.state.log_and_emit(
+                            LogLevel::Info,
+                            "security",
+                            "server identity certificate rotated",
+                        );
+                        format!("OK {fp}")
                     }
-                    let fp = new_id.fingerprint_hex();
-                    *self.state.identity.write().await = new_id;
-                    self.network.sync_relay(self.state.clone()).await;
-                    self.state.log_and_emit(
-                        LogLevel::Info,
-                        "security",
-                        "server identity certificate rotated",
-                    );
-                    format!("OK {fp}")
+                    Err(e) => format!("ERR keygen_failed {}", pct_encode(&e.to_string())),
                 }
-                Err(e) => format!("ERR keygen_failed {}", pct_encode(&e.to_string())),
-            },
+            }
             "GET_LOGS" => {
                 let after = rest.parse::<u64>().unwrap_or(0);
                 let entries = self.state.logs.since(after);

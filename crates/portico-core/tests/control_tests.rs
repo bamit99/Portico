@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use usbip::cdc::{UsbCdcAcmHandler, CDC_ACM_SUBCLASS};
 use usbip::{ClassCode, UsbDevice};
@@ -151,6 +151,11 @@ async fn control_channel_covers_all_commands_and_subscribe_events() {
     assert_eq!(send_cmd(&mut cr, &mut cw, "LIST_DEVICES").await, vec!["OK 0", "END"]);
 
     assert_eq!(send_cmd(&mut cr, &mut cw, "STOP_SERVER").await[0], "OK");
+    assert!(
+        send_cmd(&mut cr, &mut cw, "SET_STATE tls_required false")
+            .await[0]
+            .starts_with("ERR ")
+    );
     assert_eq!(
         send_cmd(&mut cr, &mut cw, &format!("UNREGISTER_CLIENT {client_id}")).await[0],
         "OK"
@@ -159,9 +164,10 @@ async fn control_channel_covers_all_commands_and_subscribe_events() {
     let logs = send_cmd(&mut cr, &mut cw, "GET_LOGS 0").await;
     assert!(logs.len() >= 3);
 
-    // Check subscriber got SERVER_STATE event
+    // Check subscriber got SERVER_STATE and DEVICE_ADDED events
     let mut saw_server_event = false;
-    for _ in 0..20 {
+    let mut saw_device_added = false;
+    for _ in 0..40 {
         let mut line = String::new();
         if tokio::time::timeout(Duration::from_millis(200), sub_reader.read_line(&mut line))
             .await
@@ -169,11 +175,25 @@ async fn control_channel_covers_all_commands_and_subscribe_events() {
         {
             if line.starts_with("EVENT SERVER_STATE running=true") {
                 saw_server_event = true;
+            }
+            if line.starts_with("EVENT DEVICE_ADDED bus_id=1-9") {
+                saw_device_added = true;
+            }
+            if saw_server_event && saw_device_added {
                 break;
             }
         }
     }
     assert!(saw_server_event);
+    assert!(saw_device_added);
+
+    // Oversized >64KiB line on separate control socket must be rejected cleanly
+    let mut big_sock = UnixStream::connect(&sock_path).await.unwrap();
+    let oversized = format!("GET_STATE {}\n", "A".repeat(70_000));
+    let _ = big_sock.write_all(oversized.as_bytes()).await;
+    let mut resp_buf = [0u8; 64];
+    let n = big_sock.read(&mut resp_buf).await.unwrap_or(0);
+    assert!(n == 0 || String::from_utf8_lossy(&resp_buf[..n]).starts_with("ERR "));
 
     assert_eq!(send_cmd(&mut cr, &mut cw, "SHUTDOWN").await[0], "OK");
     daemon.shutdown().await;
