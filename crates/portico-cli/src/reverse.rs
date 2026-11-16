@@ -6,7 +6,7 @@ use portico_proto::frame::{
     CAP_USBIP_V1, PROTOCOL_VERSION_V0,
 };
 use portico_proto::identity::{cert_fingerprint_hex, normalize_fingerprint, NodeIdentity};
-use portico_proto::tls::{build_server_tls_config, PinAllowlist};
+use portico_proto::tls::{build_server_tls_config, configure_tunnel_tcp, PinAllowlist};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -104,6 +104,7 @@ impl ReverseListener {
                 let Ok((tcp, _peer)) = listener.accept().await else {
                     break;
                 };
+                configure_tunnel_tcp(&tcp);
                 let acc = acceptor.clone();
                 let inn = inner_clone.clone();
                 tokio::spawn(async move {

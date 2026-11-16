@@ -5,7 +5,23 @@
 - [x] **M1 — Core Daemon + Protocol/Security** (`portico-proto`, `portico-relay`, `portico-core`) — 25/25 tests green + code review fixes (`afa112f`)
 - [x] **M2 — Desktop CLI** (`portico-cli`) — `discover`, `trust`, `list`, `attach`, `detach`, `listen`, `identity`, `serve`, `relay` — 29/29 workspace tests green + code review fixes (`6e08ede`)
 - [x] **M3 — Android GUI + JNI** (`portico-jni`, `android/`) — `libportico_jni.so` (`arm64-v8a`), `app-debug.apk` built, 30/30 Rust workspace tests + 9/9 Android JVM unit tests + `lintDebug` green (`423497a`)
-- [ ] **M4 — Full E2E Polish & On-Device Acceptance** (`OnePlus 12R` + real USB device) — **Blocked on hardware**: no Android device detected via `adb devices`
+- [x] **M4 — Full E2E Polish & On-Device Acceptance** (`OnePlus 12R` + real USB device) — **VERIFIED ON REAL HARDWARE (2026-11-16)**
+  - **On-device results (real hardware, 2026-11-16)**
+    - APK installed via adb (`192.168.0.181:39855`, OnePlus 12R CPH2585); `PorticoService` running; `config.json` matches spec (`tls_required=true`, `plaintext_lan=false`).
+    - SanDisk 3.2Gen1 (`0781:5595`, 123 GB) on OTG shown as shared (bus `1-2`).
+    - Desktop client from Razor over Wi-Fi: TLS 1.3 + TOFU; server-reported SHA-256 prefix matched the GUI fingerprint badge exactly; claim-token auth working; PRDS UDP discovery silent on this Wi-Fi (AP isolation) — direct `host:port` works.
+    - `portico list` → device listed; `portico attach` → enumeration ~10s (was 23.9s + failure before fixes), capacity `240328704×512B = 123 GB` stable, partitions `sdc1 sdc2` read, cache-data query succeeds (previously failed).
+    - Sustained reads: 20 MB, 1 GB, and near-end regions clean through the tunnel; zero kernel events during a 24s stability poll.
+    - Detach (`portico detach --port 0`): `lsusb` lost the device, vhci port freed, phone-side state returned to `available` **without service restart** — defect-2 release verified under graceful close.
+    - **Footnote:** one 5–6 MB region of the pendrive fails with device-originated SCSI **Medium Error** (Unrecovered read error); cross-checked all other regions read clean at full span — real media damage on the stick itself, faithfully relayed by the stack, NOT a transport bug.
+    - Both defects re-verified with real artifacts after fixes: 38/38 workspace tests, CLI (`7.2M`), JNI `.so` (`5.4M`), APK (`20M`).
+  - **Defect 1 (Slow bulk transport & capacity drop to 0) — Fixed (host/mock verified)**:
+    - Root causes fixed: (1) 1s USB transfer timeout silently swallowed into `Ok(Vec::new())` (`status=0, actual_length=0`) on Bulk/Control; (2) USB errors mapped to `status=1` instead of Linux USB/IP errnos (`-EPIPE` `-32`, `-ETIMEDOUT` `-110`, `-ENODEV` `-19`, `-EOVERFLOW` `-75`); (3) `CLEAR_FEATURE(ENDPOINT_HALT)` and `SET_INTERFACE` ran raw `control_transfer` instead of `libusb` `clear_halt` / `set_alternate_setting` (`usbfs` toggle/endpoint-table desync); (4) serial URB execution holding `intf.handler` `Mutex` + 12-read header parsing + extra 1MB buffer copies; (5) missing `TCP_NODELAY` across all TCP sockets and 8KB `copy_bidirectional` buffer; (6) `ep0` `bMaxPacketSize0`, BCD USB/device version encoding, and SuperSpeed Endpoint Companion descriptors (`0x30`) omitted in synthesized descriptors.
+    - Fixes: per-endpoint FIFO pipelined URB workers + `spawn_blocking` via `clone_box()` in `vendor/usbip`, single-read 44-byte URB header parse + vectored large-response write, `transfer_timeout()` (10s–60s) + strict errno mapping + `128KB` `NoMem` fallback + zero-copy `truncate`, `TCP_NODELAY` + `128KB` `copy_bidirectional_with_sizes`.
+    - Mock BOT benchmark (`defect_regression_tests`): probe + partition-table read ~4.8ms (<5s target), 24x 1MB sequential reads ~242ms (~99 MiB/s over TLS).
+  - **Defect 2 (Stale `InUse` claim after client bridge death) — Fixed (host/mock verified)**:
+    - Root causes fixed: sequential `usbip::handler` blocked on `rusb` couldn't poll TCP EOF; missing TCP keepalive / `TCP_USER_TIMEOUT` left half-open Wi-Fi/NAT tunnels open indefinitely; missing RAII claim guard and `usbfs` interface URB abort on tunnel teardown.
+    - Fixes: `configure_tunnel_tcp` (`TCP_NODELAY`, `TCP_KEEPIDLE=2s`, `TCP_KEEPINTVL=1s`, `TCP_KEEPCNT=2`, `TCP_USER_TIMEOUT=4s` on Linux/Android) across server, client, reverse listener, bridge, and relay; concurrent socket reader/writer in `usbip::handler` so TCP close/timeout aborts immediately (<50ms); `TunnelClaimGuard` + `on_tunnel_release()` (`release_interface`/`claim_interface` on `usbfs` when URBs were in flight) before resetting `DeviceState::Shared`.
 
 ## Log
 - **2026-11-16**: Initialized `DESIGN.md` (with builder-check resolution) and `plans/` for all 4 subsystems.
@@ -13,3 +29,4 @@
 - **2026-11-16**: Completed M2 (`portico-cli`) with TDD + code review fixes (`6e08ede`).
 - **2026-11-16**: Completed M3 (`portico-jni`, `android/`) with NDK r29 `arm64-v8a` build, Compose Material 3 app (`io.portico.app`), code review fixes (`423497a`), and APK build (`android/app/build/outputs/apk/debug/app-debug.apk`).
 - **2026-11-16**: Stopped at M4 on-device acceptance: `adb devices -l` lists 0 attached devices.
+- **2026-11-16**: Diagnosed and fixed M4 Defect 1 (slow bulk transport / `capacity change to 0`) and Defect 2 (stale `InUse` claim on client kill / half-open tunnels). 37/37 Rust workspace tests green, release CLI (`target/release/portico`), JNI (`arm64-v8a/libportico_jni.so`), and Android debug APK (`android/app/build/outputs/apk/debug/app-debug.apk`) rebuilt.

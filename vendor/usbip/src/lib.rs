@@ -10,11 +10,14 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Result};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::task::JoinHandle;
 use usbip_protocol::UsbIpCommand;
 
 #[cfg(feature = "serde")]
@@ -105,6 +108,7 @@ impl UsbIpServer {
                     endpoints,
                     string_interface: alt_setting.string_index().map(|nz| nz.get()).unwrap_or(0),
                     class_specific_descriptor: Vec::new(),
+                    endpoint_extras: Vec::new(),
                     handler,
                 });
             }
@@ -233,6 +237,7 @@ impl UsbIpServer {
                     endpoints,
                     string_interface: intf_desc.description_string_index().unwrap_or(0),
                     class_specific_descriptor: Vec::from(intf_desc.extra()),
+                    endpoint_extras: Vec::new(),
                     handler,
                 });
             }
@@ -390,53 +395,192 @@ impl UsbIpServer {
     }
 }
 
-pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
-    mut socket: &mut T,
+fn map_io_err_to_usbip_errno(err: &std::io::Error) -> i32 {
+    match err.kind() {
+        ErrorKind::BrokenPipe => -32,     // -EPIPE (endpoint stall)
+        ErrorKind::TimedOut => -110,      // -ETIMEDOUT
+        ErrorKind::NotConnected => -19,   // -ENODEV
+        ErrorKind::InvalidData => -75,    // -EOVERFLOW
+        ErrorKind::InvalidInput => -22,   // -EINVAL
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => -104, // -ECONNRESET
+        _ => -71,                         // -EPROTO
+    }
+}
+
+struct UrbJob {
+    device: UsbDevice,
+    ep: UsbEndpoint,
+    intf: Option<UsbInterface>,
+    header: usbip_protocol::UsbIpHeaderBasic,
+    transfer_buffer_length: u32,
+    setup: SetupPacket,
+    data: Vec<u8>,
+    out: bool,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct InFlightGuard {
+    seqnum: u32,
+    pending_unlinks: Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>,
+    in_flight: Arc<AtomicUsize>,
+    zero_notify: Arc<Notify>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.pending_unlinks.lock() {
+            map.remove(&self.seqnum);
+        }
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.zero_notify.notify_waiters();
+        }
+    }
+}
+
+struct HandlerGuard {
     server: Arc<UsbIpServer>,
-) -> Result<()> {
-    let mut current_import_device_id: Option<String> = None;
-    loop {
-        let command = UsbIpCommand::read_from_socket(&mut socket).await;
-        if let Err(err) = command {
-            if let Some(dev_id) = current_import_device_id {
-                let mut used_devices = server.used_devices.write().await;
-                let mut available_devices = server.available_devices.write().await;
-                match used_devices.remove(&dev_id) {
-                    Some(dev) => available_devices.push(dev),
-                    None => unreachable!(),
+    imported_id: Arc<Mutex<Option<String>>>,
+    worker_handles: Vec<JoinHandle<()>>,
+    cleaned: bool,
+}
+
+impl Drop for HandlerGuard {
+    fn drop(&mut self) {
+        for h in self.worker_handles.drain(..) {
+            h.abort();
+        }
+        if self.cleaned {
+            return;
+        }
+        let dev_id = self
+            .imported_id
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(dev_id) = dev_id {
+            if let (Ok(mut used), Ok(mut avail)) = (
+                self.server.used_devices.try_write(),
+                self.server.available_devices.try_write(),
+            ) {
+                if let Some(dev) = used.remove(&dev_id) {
+                    dev.release_tunnel_handlers();
+                    avail.push(dev);
+                }
+            } else {
+                let server = self.server.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let mut used = server.used_devices.write().await;
+                        let mut avail = server.available_devices.write().await;
+                        if let Some(dev) = used.remove(&dev_id) {
+                            dev.release_tunnel_handlers();
+                            avail.push(dev);
+                        }
+                    });
                 }
             }
-
-            if err.kind() == ErrorKind::UnexpectedEof {
-                info!("Remote closed the connection");
-                return Ok(());
-            } else {
-                return Err(err);
-            }
         }
+    }
+}
 
-        let used_devices = server.used_devices.read().await;
-        let mut current_import_device = current_import_device_id
-            .clone()
-            .and_then(|ref id| used_devices.get(id));
+async fn release_imported_device(
+    server: &Arc<UsbIpServer>,
+    imported_id: &Arc<Mutex<Option<String>>>,
+) {
+    let dev_id = imported_id.lock().ok().and_then(|mut g| g.take());
+    if let Some(dev_id) = dev_id {
+        let removed = {
+            let mut used = server.used_devices.write().await;
+            used.remove(&dev_id)
+        };
+        if let Some(dev) = removed {
+            let dev_clone = dev.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                dev_clone.release_tunnel_handlers();
+            })
+            .await;
+            server.available_devices.write().await.push(dev);
+        }
+    }
+}
 
-        match command.unwrap() {
+pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+    socket: &mut T,
+    server: Arc<UsbIpServer>,
+) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let (resp_tx, mut resp_rx) = mpsc::channel::<UsbIpResponse>(128);
+    let mut resp_tx_opt = Some(resp_tx);
+
+    let imported_id = Arc::new(Mutex::new(None::<String>));
+    let mut current_device: Option<UsbDevice> = None;
+    let mut ep_workers: HashMap<u8, mpsc::Sender<UrbJob>> = HashMap::new();
+    let pending_unlinks: Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let zero_notify = Arc::new(Notify::new());
+
+    let mut guard = HandlerGuard {
+        server: server.clone(),
+        imported_id: imported_id.clone(),
+        worker_handles: Vec::new(),
+        cleaned: false,
+    };
+
+    let write_fut = async {
+        while let Some(first) = resp_rx.recv().await {
+            first.write_to_socket(&mut writer).await?;
+            while let Ok(next) = resp_rx.try_recv() {
+                next.write_to_socket(&mut writer).await?;
+            }
+            writer.flush().await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::pin!(write_fut);
+
+    let read_res: Result<()> = loop {
+        let cmd_res = tokio::select! {
+            r = UsbIpCommand::read_from_socket(&mut reader) => r,
+            w = &mut write_fut => {
+                guard.worker_handles.iter().for_each(|h| h.abort());
+                release_imported_device(&server, &imported_id).await;
+                guard.cleaned = true;
+                return w;
+            }
+        };
+
+        let command = match cmd_res {
+            Ok(c) => c,
+            Err(err) => break Err(err),
+        };
+
+        let Some(ref tx) = resp_tx_opt else {
+            break Ok(());
+        };
+
+        match command {
             UsbIpCommand::OpReqDevlist { .. } => {
                 trace!("Got OP_REQ_DEVLIST");
                 let devices = server.available_devices.read().await;
-
-                // OP_REP_DEVLIST
-                UsbIpResponse::op_rep_devlist(&devices)
-                    .write_to_socket(socket)
-                    .await?;
-                trace!("Sent OP_REP_DEVLIST");
+                let resp = UsbIpResponse::op_rep_devlist(&devices);
+                drop(devices);
+                if tx.send(resp).await.is_err() {
+                    break Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "response writer closed",
+                    ));
+                }
+                trace!("Queued OP_REP_DEVLIST");
             }
             UsbIpCommand::OpReqImport { busid, .. } => {
                 trace!("Got OP_REQ_IMPORT");
-
-                current_import_device_id = None;
-                current_import_device = None;
-                std::mem::drop(used_devices);
+                ep_workers.clear();
+                for h in guard.worker_handles.drain(..) {
+                    h.abort();
+                }
+                current_device = None;
+                release_imported_device(&server, &imported_id).await;
 
                 let mut used_devices = server.used_devices.write().await;
                 let mut available_devices = server.available_devices.write().await;
@@ -446,20 +590,29 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                     if busid_compare == dev.bus_id.as_bytes() {
                         let dev = available_devices.remove(i);
                         let dev_id = dev.bus_id.clone();
-                        used_devices.insert(dev.bus_id.clone(), dev);
-                        current_import_device_id = dev_id.clone().into();
-                        current_import_device = Some(used_devices.get(&dev_id).unwrap());
+                        current_device = Some(dev.clone());
+                        used_devices.insert(dev_id.clone(), dev);
+                        if let Ok(mut g) = imported_id.lock() {
+                            *g = Some(dev_id);
+                        }
                         break;
                     }
                 }
+                drop(available_devices);
+                drop(used_devices);
 
-                let res = if let Some(dev) = current_import_device {
+                let res = if let Some(ref dev) = current_device {
                     UsbIpResponse::op_rep_import_success(dev)
                 } else {
                     UsbIpResponse::op_rep_import_fail()
                 };
-                res.write_to_socket(socket).await?;
-                trace!("Sent OP_REP_IMPORT");
+                if tx.send(res).await.is_err() {
+                    break Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "response writer closed",
+                    ));
+                }
+                trace!("Queued OP_REP_IMPORT");
             }
             UsbIpCommand::UsbIpCmdSubmit {
                 mut header,
@@ -468,82 +621,184 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 data,
                 ..
             } => {
-                trace!("Got USBIP_CMD_SUBMIT");
-                let device = current_import_device.unwrap();
+                trace!("Got USBIP_CMD_SUBMIT seq={}", header.seqnum);
+                let Some(ref device) = current_device else {
+                    header.command = USBIP_RET_SUBMIT.into();
+                    let _ = tx
+                        .send(UsbIpResponse::usbip_ret_submit_err(&header, -19))
+                        .await;
+                    continue;
+                };
 
                 let out = header.direction == 0;
-                let real_ep = if out { header.ep } else { header.ep | 0x80 };
-
+                let real_ep = (if out { header.ep } else { header.ep | 0x80 }) as u8;
                 header.command = USBIP_RET_SUBMIT.into();
 
-                let res = match device.find_ep(real_ep as u8) {
-                    None => {
-                        warn!("Endpoint {real_ep:02x?} not found");
-                        UsbIpResponse::usbip_ret_submit_fail(&header)
+                let Some((ep, intf)) = device.find_ep(real_ep) else {
+                    warn!("Endpoint {real_ep:02x?} not found");
+                    if tx
+                        .send(UsbIpResponse::usbip_ret_submit_err(&header, -22))
+                        .await
+                        .is_err()
+                    {
+                        break Err(std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "response writer closed",
+                        ));
                     }
-                    Some((ep, intf)) => {
-                        trace!("->Endpoint {ep:02x?}");
-                        trace!("->Setup {setup:02x?}");
-                        trace!("->Request {data:02x?}");
-                        let resp = device
-                            .handle_urb(
-                                ep,
-                                intf,
-                                transfer_buffer_length,
-                                SetupPacket::parse(&setup),
-                                &data,
-                            )
-                            .await;
+                    continue;
+                };
 
-                        match resp {
-                            Ok(resp) => {
-                                if out {
-                                    trace!("<-Wrote {}", data.len());
-                                } else {
-                                    trace!("<-Resp {resp:02x?}");
+                let ep_tx = if let Some(existing) = ep_workers.get(&real_ep) {
+                    existing.clone()
+                } else {
+                    let (wtx, mut wrx) = mpsc::channel::<UrbJob>(32);
+                    let rtx = tx.clone();
+                    let unlinks = pending_unlinks.clone();
+                    let inf = in_flight.clone();
+                    let znot = zero_notify.clone();
+                    let jh = tokio::spawn(async move {
+                        while let Some(job) = wrx.recv().await {
+                            let _inflight_guard = InFlightGuard {
+                                seqnum: job.header.seqnum,
+                                pending_unlinks: unlinks.clone(),
+                                in_flight: inf.clone(),
+                                zero_notify: znot.clone(),
+                            };
+                            let res = if job.cancelled.load(Ordering::Acquire) {
+                                UsbIpResponse::usbip_ret_submit_err(&job.header, -104)
+                            } else {
+                                let resp = job
+                                    .device
+                                    .handle_urb(
+                                        job.ep,
+                                        job.intf.as_ref(),
+                                        job.transfer_buffer_length,
+                                        job.setup,
+                                        &job.data,
+                                    )
+                                    .await;
+                                match resp {
+                                    Ok(resp) => {
+                                        let actual_length = if job.out {
+                                            debug_assert!(
+                                                resp.is_empty(),
+                                                "OUT transfer should return empty response buffer"
+                                            );
+                                            job.data.len() as u32
+                                        } else {
+                                            resp.len() as u32
+                                        };
+                                        UsbIpResponse::usbip_ret_submit_success(
+                                            &job.header,
+                                            0,
+                                            0,
+                                            actual_length,
+                                            resp,
+                                            vec![],
+                                        )
+                                    }
+                                    Err(err) => {
+                                        let errno = map_io_err_to_usbip_errno(&err);
+                                        warn!("Error handling URB seq={} ep={:#04x}: {err} (errno={errno})", job.header.seqnum, job.ep.address);
+                                        UsbIpResponse::usbip_ret_submit_err(&job.header, errno)
+                                    }
                                 }
-                                let actual_length = if out {
-                                    debug_assert!(
-                                        resp.is_empty(),
-                                        "OUT transfer should return empty response buffer"
-                                    );
-                                    data.len() as u32
-                                } else {
-                                    resp.len() as u32
-                                };
-                                UsbIpResponse::usbip_ret_submit_success(
-                                    &header,
-                                    0,
-                                    0,
-                                    actual_length,
-                                    resp,
-                                    vec![],
-                                )
-                            }
-                            Err(err) => {
-                                warn!("Error handling URB: {err}");
-                                UsbIpResponse::usbip_ret_submit_fail(&header)
+                            };
+                            if rtx.send(res).await.is_err() {
+                                break;
                             }
                         }
-                    }
+                    });
+                    guard.worker_handles.push(jh);
+                    ep_workers.insert(real_ep, wtx.clone());
+                    wtx
                 };
-                res.write_to_socket(socket).await?;
-                trace!("Sent USBIP_RET_SUBMIT");
+
+                let seqnum = header.seqnum;
+                let cancelled = Arc::new(AtomicBool::new(false));
+                if let Ok(mut map) = pending_unlinks.lock() {
+                    map.insert(seqnum, cancelled.clone());
+                }
+                in_flight.fetch_add(1, Ordering::AcqRel);
+
+                let job = UrbJob {
+                    device: device.clone(),
+                    ep,
+                    intf: intf.cloned(),
+                    header,
+                    transfer_buffer_length,
+                    setup: SetupPacket::parse(&setup),
+                    data,
+                    out,
+                    cancelled,
+                };
+                if ep_tx.send(job).await.is_err() {
+                    if let Ok(mut map) = pending_unlinks.lock() {
+                        map.remove(&seqnum);
+                    }
+                    if in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        zero_notify.notify_waiters();
+                    }
+                    break Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "endpoint worker closed",
+                    ));
+                }
             }
             UsbIpCommand::UsbIpCmdUnlink {
                 mut header,
                 unlink_seqnum,
             } => {
                 trace!("Got USBIP_CMD_UNLINK for {unlink_seqnum:10x?}");
-
+                if let Ok(map) = pending_unlinks.lock() {
+                    if let Some(flag) = map.get(&unlink_seqnum) {
+                        flag.store(true, Ordering::Release);
+                    }
+                }
                 header.command = USBIP_RET_UNLINK.into();
-
                 let res = UsbIpResponse::usbip_ret_unlink_success(&header);
-                res.write_to_socket(socket).await?;
-                trace!("Sent USBIP_RET_UNLINK");
+                if tx.send(res).await.is_err() {
+                    break Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "response writer closed",
+                    ));
+                }
+                trace!("Queued USBIP_RET_UNLINK");
             }
         }
+    };
+
+    let ret = match read_res {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            info!("Remote closed the connection");
+            if in_flight.load(Ordering::Acquire) > 0 {
+                let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                    while in_flight.load(Ordering::Acquire) > 0 {
+                        zero_notify.notified().await;
+                    }
+                })
+                .await;
+            }
+            ep_workers.clear();
+            resp_tx_opt.take();
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut write_fut).await;
+            Ok(())
+        }
+        Err(err) => {
+            ep_workers.clear();
+            resp_tx_opt.take();
+            Err(err)
+        }
+    };
+
+    for h in guard.worker_handles.drain(..) {
+        h.abort();
     }
+    release_imported_device(&server, &imported_id).await;
+    guard.cleaned = true;
+    ret
 }
 
 /// Spawn a USB/IP server at `addr` using [TcpListener]

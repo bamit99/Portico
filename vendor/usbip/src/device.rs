@@ -191,9 +191,28 @@ impl UsbDevice {
             endpoints,
             string_interface,
             class_specific_descriptor,
+            endpoint_extras: Vec::new(),
             handler,
         });
         self
+    }
+
+    pub fn set_ep0_max_packet_size(&mut self, max_packet_size: u16) {
+        self.ep0_in.max_packet_size = max_packet_size;
+        self.ep0_out.max_packet_size = max_packet_size;
+    }
+
+    pub fn release_tunnel_handlers(&self) {
+        if let Some(ref dh) = self.device_handler {
+            if let Ok(guard) = dh.lock() {
+                guard.on_tunnel_release();
+            }
+        }
+        for intf in &self.interfaces {
+            if let Ok(guard) = intf.handler.lock() {
+                guard.on_tunnel_release();
+            }
+        }
     }
 
     pub fn with_device_handler(
@@ -275,6 +294,54 @@ impl UsbDevice {
         result
     }
 
+    async fn dispatch_interface_urb(
+        intf: &UsbInterface,
+        ep: UsbEndpoint,
+        transfer_buffer_length: u32,
+        setup_packet: SetupPacket,
+        out_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let cloned = {
+            let guard = intf.handler.lock().unwrap();
+            guard.clone_box()
+        };
+        if let Some(mut handler) = cloned {
+            let intf_clone = intf.clone();
+            let req = out_data.to_vec();
+            tokio::task::spawn_blocking(move || {
+                handler.handle_urb(&intf_clone, ep, transfer_buffer_length, setup_packet, &req)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("usb worker join error: {e}")))?
+        } else {
+            let mut handler = intf.handler.lock().unwrap();
+            handler.handle_urb(intf, ep, transfer_buffer_length, setup_packet, out_data)
+        }
+    }
+
+    async fn dispatch_device_urb(
+        dh: &Arc<Mutex<Box<dyn UsbDeviceHandler + Send>>>,
+        transfer_buffer_length: u32,
+        setup_packet: SetupPacket,
+        out_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let cloned = {
+            let guard = dh.lock().unwrap();
+            guard.clone_box()
+        };
+        if let Some(mut handler) = cloned {
+            let req = out_data.to_vec();
+            tokio::task::spawn_blocking(move || {
+                handler.handle_urb(transfer_buffer_length, setup_packet, &req)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("usb device worker join error: {e}")))?
+        } else {
+            let mut handler = dh.lock().unwrap();
+            handler.handle_urb(transfer_buffer_length, setup_packet, out_data)
+        }
+    }
+
     pub(crate) async fn handle_urb(
         &self,
         ep: UsbEndpoint,
@@ -287,6 +354,9 @@ impl UsbDevice {
         use Direction::*;
         use EndpointAttributes::*;
         use StandardRequest::*;
+
+        let bcd_usb_lo = ((self.usb_version.minor & 0x0F) << 4) | (self.usb_version.patch & 0x0F);
+        let bcd_dev_lo = ((self.device_bcd.minor & 0x0F) << 4) | (self.device_bcd.patch & 0x0F);
 
         match (FromPrimitive::from_u8(ep.attributes), ep.direction()) {
             (Some(Control), In) => {
@@ -305,8 +375,8 @@ impl UsbDevice {
                                 let mut desc = vec![
                                     0x12,         // bLength
                                     Device as u8, // bDescriptorType: Device
-                                    self.usb_version.minor,
-                                    self.usb_version.major, // bcdUSB: USB 2.0
+                                    bcd_usb_lo,
+                                    self.usb_version.major, // bcdUSB
                                     self.device_class,      // bDeviceClass
                                     self.device_subclass,   // bDeviceSubClass
                                     self.device_protocol,   // bDeviceProtocol
@@ -315,7 +385,7 @@ impl UsbDevice {
                                     (self.vendor_id >> 8) as u8,
                                     self.product_id as u8, // idProduct
                                     (self.product_id >> 8) as u8,
-                                    self.device_bcd.minor, // bcdDevice
+                                    bcd_dev_lo, // bcdDevice
                                     self.device_bcd.major,
                                     self.string_manufacturer, // iManufacturer
                                     self.string_product,      // iProduct
@@ -330,6 +400,15 @@ impl UsbDevice {
                                 Ok(desc)
                             }
                             Some(BOS) => {
+                                if let Some(ref dh) = self.device_handler {
+                                    return Self::dispatch_device_urb(
+                                        dh,
+                                        transfer_buffer_length,
+                                        setup_packet,
+                                        out_data,
+                                    )
+                                    .await;
+                                }
                                 debug!("Get BOS descriptor");
                                 let mut desc = vec![
                                     0x05,      // bLength
@@ -374,7 +453,7 @@ impl UsbDevice {
                                     let mut specific = intf.class_specific_descriptor.clone();
                                     intf_desc.append(&mut specific);
                                     // endpoint descriptors
-                                    for endpoint in &intf.endpoints {
+                                    for (ep_idx, endpoint) in intf.endpoints.iter().enumerate() {
                                         let mut ep_desc = vec![
                                             0x07,                // bLength
                                             Endpoint as u8,      // bDescriptorType: Endpoint
@@ -385,6 +464,11 @@ impl UsbDevice {
                                             endpoint.interval,                     // bInterval
                                         ];
                                         intf_desc.append(&mut ep_desc);
+                                        if let Some(extra) = intf.endpoint_extras.get(ep_idx) {
+                                            if !extra.is_empty() {
+                                                intf_desc.extend_from_slice(extra);
+                                            }
+                                        }
                                     }
                                     desc.append(&mut intf_desc);
                                 }
@@ -433,20 +517,37 @@ impl UsbDevice {
                                         desc.resize(setup_packet.length as usize, 0);
                                     }
                                     Ok(desc)
+                                } else if let Some(ref dh) = self.device_handler {
+                                    Self::dispatch_device_urb(
+                                        dh,
+                                        transfer_buffer_length,
+                                        setup_packet,
+                                        out_data,
+                                    )
+                                    .await
                                 } else {
                                     Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidInput,
+                                        std::io::ErrorKind::BrokenPipe,
                                         format!("Invalid string index: {index}"),
                                     ))
                                 }
                             }
                             Some(DeviceQualifier) => {
+                                if let Some(ref dh) = self.device_handler {
+                                    return Self::dispatch_device_urb(
+                                        dh,
+                                        transfer_buffer_length,
+                                        setup_packet,
+                                        out_data,
+                                    )
+                                    .await;
+                                }
                                 debug!("Get device qualifier descriptor");
                                 // Device_Qualifier Descriptor
                                 let mut desc = vec![
                                     0x0A,                  // bLength
                                     DeviceQualifier as u8, // bDescriptorType: Device Qualifier
-                                    self.usb_version.minor,
+                                    bcd_usb_lo,
                                     self.usb_version.major, // bcdUSB
                                     self.device_class,      // bDeviceClass
                                     self.device_subclass,   // bDeviceSUbClass
@@ -463,30 +564,46 @@ impl UsbDevice {
                                 Ok(desc)
                             }
                             _ => {
+                                if let Some(ref dh) = self.device_handler {
+                                    return Self::dispatch_device_urb(
+                                        dh,
+                                        transfer_buffer_length,
+                                        setup_packet,
+                                        out_data,
+                                    )
+                                    .await;
+                                }
                                 warn!("unknown desc type: {setup_packet:x?}");
                                 Ok(vec![])
                             }
                         }
                     }
                     _ if setup_packet.request_type & 0xF == 1 => {
-                        // to interface
-                        // see https://www.beyondlogic.org/usbnutshell/usb6.shtml
-                        // only low 8 bits are valid
-                        let intf = &self.interfaces[setup_packet.index as usize & 0xFF];
-                        let mut handler = intf.handler.lock().unwrap();
-                        handler.handle_urb(intf, ep, transfer_buffer_length, setup_packet, out_data)
+                        let idx = setup_packet.index as usize & 0xFF;
+                        let intf = self.interfaces.get(idx).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("invalid interface index {idx}"),
+                            )
+                        })?;
+                        Self::dispatch_interface_urb(
+                            intf,
+                            ep,
+                            transfer_buffer_length,
+                            setup_packet,
+                            out_data,
+                        )
+                        .await
                     }
                     _ if self.device_handler.is_some() => {
-                        // device_handler implementations (RusbUsbHostDeviceHandler,
-                        // NusbUsbHostDeviceHandler in host.rs) reconstruct the full
-                        // recipient from setup_packet.request_type themselves, so they
-                        // work for device/endpoint/other recipients. Interface-recipient
-                        // requests are caught by the arm above.
-                        let lock = self.device_handler.as_ref().unwrap();
-                        let mut handler = lock.lock().unwrap();
-                        handler.handle_urb(transfer_buffer_length, setup_packet, out_data)
+                        let dh = self.device_handler.as_ref().unwrap();
+                        Self::dispatch_device_urb(dh, transfer_buffer_length, setup_packet, out_data)
+                            .await
                     }
-                    _ => unimplemented!("control in"),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "unhandled control in",
+                    )),
                 }
             }
             (Some(Control), Out) => {
@@ -496,42 +613,56 @@ impl UsbDevice {
                     setup_packet.request_type,
                     FromPrimitive::from_u8(setup_packet.request),
                 ) {
-                    (0b00000000, Some(SetConfiguration)) => {
-                        let mut desc = vec![
-                            self.configuration_value, // bConfigurationValue
-                        ];
-
-                        // requested len too short: wLength < real length
-                        if setup_packet.length < desc.len() as u16 {
-                            desc.resize(setup_packet.length as usize, 0);
-                        }
-                        Ok(desc)
-                    }
+                    (0b00000000, Some(SetConfiguration)) => Ok(Vec::new()),
                     _ if setup_packet.request_type & 0xF == 1 => {
-                        // to interface
-                        // see https://www.beyondlogic.org/usbnutshell/usb6.shtml
-                        // only low 8 bits are valid
-                        let intf = &self.interfaces[setup_packet.index as usize & 0xFF];
-                        let mut handler = intf.handler.lock().unwrap();
-                        handler.handle_urb(intf, ep, transfer_buffer_length, setup_packet, out_data)
+                        let idx = setup_packet.index as usize & 0xFF;
+                        let intf = self.interfaces.get(idx).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("invalid interface index {idx}"),
+                            )
+                        })?;
+                        Self::dispatch_interface_urb(
+                            intf,
+                            ep,
+                            transfer_buffer_length,
+                            setup_packet,
+                            out_data,
+                        )
+                        .await
                     }
                     _ if self.device_handler.is_some() => {
-                        // non-interface recipients forwarded to device_handler
-                        // (see the control-in arm above for details).
-                        let lock = self.device_handler.as_ref().unwrap();
-                        let mut handler = lock.lock().unwrap();
-                        handler.handle_urb(transfer_buffer_length, setup_packet, out_data)
+                        let dh = self.device_handler.as_ref().unwrap();
+                        Self::dispatch_device_urb(dh, transfer_buffer_length, setup_packet, out_data)
+                            .await
                     }
-                    _ => unimplemented!("control out"),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "unhandled control out",
+                    )),
                 }
             }
             (Some(_), _) => {
                 // others
-                let intf = intf.unwrap();
-                let mut handler = intf.handler.lock().unwrap();
-                handler.handle_urb(intf, ep, transfer_buffer_length, setup_packet, out_data)
+                let intf = intf.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "missing interface for endpoint transfer",
+                    )
+                })?;
+                Self::dispatch_interface_urb(
+                    intf,
+                    ep,
+                    transfer_buffer_length,
+                    setup_packet,
+                    out_data,
+                )
+                .await
             }
-            _ => unimplemented!("transfer to {:?}", ep),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsupported endpoint {:?}", ep),
+            )),
         }
     }
 }
@@ -548,6 +679,14 @@ pub trait UsbDeviceHandler: std::fmt::Debug {
         setup: SetupPacket,
         req: &[u8],
     ) -> Result<Vec<u8>>;
+
+    /// Optional clone hook so concurrent/pipelined URB execution can run without holding the device Mutex across blocking I/O.
+    fn clone_box(&self) -> Option<Box<dyn UsbDeviceHandler + Send>> {
+        None
+    }
+
+    /// Optional hook called when a USB/IP tunnel releases the device.
+    fn on_tunnel_release(&self) {}
 
     /// Helper to downcast to actual struct
     ///

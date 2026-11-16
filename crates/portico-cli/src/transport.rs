@@ -5,7 +5,9 @@ use portico_proto::frame::{
 };
 use portico_proto::identity::normalize_fingerprint;
 use portico_proto::relay_proto::{parse_relay_uri, RelayFrame};
-use portico_proto::tls::{build_client_tls_config, is_lan_or_loopback_ip, CertCheckPolicy};
+use portico_proto::tls::{
+    build_client_tls_config, configure_tunnel_tcp, is_lan_or_loopback_ip, CertCheckPolicy,
+};
 use portico_proto::tofu::{KnownHosts, TofuDecision};
 use portico_proto::DEFAULT_PORT;
 use rand::RngCore;
@@ -111,13 +113,18 @@ async fn resolve_lan_checked(addr: &str) -> Result<SocketAddr, CliError> {
 
 async fn open_raw_tcp(ep: &TargetEndpoint) -> Result<TcpStream, CliError> {
     match ep {
-        TargetEndpoint::Direct(addr) => Ok(TcpStream::connect(addr).await?),
+        TargetEndpoint::Direct(addr) => {
+            let tcp = TcpStream::connect(addr).await?;
+            configure_tunnel_tcp(&tcp);
+            Ok(tcp)
+        }
         TargetEndpoint::Relay {
             relay_addr,
             node_id,
             ..
         } => {
             let mut tcp = TcpStream::connect(relay_addr).await?;
+            configure_tunnel_tcp(&tcp);
             let mut conn_nonce = [0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut conn_nonce);
             RelayFrame::ClientConnect {
@@ -138,7 +145,9 @@ pub async fn connect_and_auth(opts: ConnectOptions<'_>) -> Result<AuthenticatedS
         match &ep {
             TargetEndpoint::Direct(addr) => {
                 let sa = resolve_lan_checked(addr).await?;
-                Box::new(TcpStream::connect(sa).await?)
+                let tcp = TcpStream::connect(sa).await?;
+                configure_tunnel_tcp(&tcp);
+                Box::new(tcp)
             }
             TargetEndpoint::Relay { .. } => {
                 return Err(CliError::PlaintextNonLanRefused(opts.target.to_string()));

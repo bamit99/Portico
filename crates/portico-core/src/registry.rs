@@ -383,6 +383,17 @@ impl DeviceRegistry {
     }
 
     pub async fn release_claim(&self, bus_id: &str, ignored: &[VidPid]) {
+        let dev_to_release = {
+            let guard = self.devices.lock().await;
+            guard.get(bus_id).and_then(|e| e.usb_device.clone())
+        };
+        if let Some(dev) = dev_to_release {
+            let _ = tokio::task::spawn_blocking(move || {
+                dev.release_tunnel_handlers();
+            })
+            .await;
+        }
+
         let ev = {
             let mut guard = self.devices.lock().await;
             let Some(entry) = guard.get_mut(bus_id) else {

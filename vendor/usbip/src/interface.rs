@@ -10,6 +10,7 @@ pub struct UsbInterface {
     pub endpoints: Vec<UsbEndpoint>,
     pub string_interface: u8,
     pub class_specific_descriptor: Vec<u8>,
+    pub endpoint_extras: Vec<Vec<u8>>,
 
     #[cfg_attr(feature = "serde", serde(skip))]
     pub handler: Arc<Mutex<Box<dyn UsbInterfaceHandler + Send>>>,
@@ -32,6 +33,14 @@ pub trait UsbInterfaceHandler: std::fmt::Debug {
         setup: SetupPacket,
         req: &[u8],
     ) -> Result<Vec<u8>>;
+
+    /// Optional clone hook so concurrent/pipelined URB execution can run without holding the interface Mutex across blocking I/O.
+    fn clone_box(&self) -> Option<Box<dyn UsbInterfaceHandler + Send>> {
+        None
+    }
+
+    /// Optional hook called when a USB/IP tunnel releases the device.
+    fn on_tunnel_release(&self) {}
 
     /// Helper to downcast to actual struct
     ///

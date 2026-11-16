@@ -141,3 +141,115 @@ async fn bridge_tunnels_usbip_over_tls_and_fails_on_missing_bus_or_failing_usbip
 
     daemon.shutdown().await;
 }
+
+#[tokio::test]
+async fn bridge_kill_releases_claim_and_allows_immediate_reattach() {
+    let daemon_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let sock = daemon_dir.path().join("portico-ctrl.sock");
+
+    let daemon = PorticoDaemon::start_with_bind_overrides(
+        daemon_dir.path().to_path_buf(),
+        sock,
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+    )
+    .await
+    .unwrap();
+    let h = daemon.handle();
+    h.state
+        .registry
+        .register_usb_device(
+            make_sim_cdc("1-1"),
+            "Acme".into(),
+            "Widget".into(),
+            "S1".into(),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.exec_command("START_SERVER").await, "OK");
+
+    let tcp_addr = h.network.bound_tcp_addr().await.unwrap().to_string();
+    let token = h
+        .exec_command("GET_TOKEN")
+        .await
+        .strip_prefix("OK ")
+        .unwrap()
+        .to_string();
+    let fp = h.state.identity.read().await.fingerprint_hex();
+
+    // Bridge 1 attaches
+    let s1 = connect_and_auth(ConnectOptions {
+        config_dir: cli_dir.path(),
+        target: &tcp_addr,
+        token: &token,
+        trust_fp: Some(&fp),
+        insecure_lan_plaintext: false,
+        client_name: "cli1",
+    })
+    .await
+    .unwrap();
+    let (local_addr1, bridge1) = start_local_usbip_bridge(s1, "1-1").await.unwrap();
+    let mut local1 = TcpStream::connect(local_addr1).await.unwrap();
+    let mut busid = b"1-1".to_vec();
+    busid.resize(32, 0);
+    local1
+        .write_all(
+            &UsbIpCommand::OpReqImport {
+                status: 0,
+                busid: busid.clone().try_into().unwrap(),
+            }
+            .to_bytes(),
+        )
+        .await
+        .unwrap();
+    let _ver = local1.read_u32().await.unwrap();
+    assert_eq!(local1.read_u32().await.unwrap(), 0);
+    let mut info = vec![0u8; 0x138];
+    local1.read_exact(&mut info).await.unwrap();
+
+    // Second attach while bridge 1 is alive MUST fail with InUse
+    let s2 = connect_and_auth(ConnectOptions {
+        config_dir: cli_dir.path(),
+        target: &tcp_addr,
+        token: &token,
+        trust_fp: Some(&fp),
+        insecure_lan_plaintext: false,
+        client_name: "cli2",
+    })
+    .await
+    .unwrap();
+    let err = start_local_usbip_bridge(s2, "1-1").await.unwrap_err();
+    assert!(err.to_string().contains("InUse"));
+
+    // Simulate client bridge killed abruptly (abort bridge task + drop local socket)
+    bridge1.abort();
+    drop(local1);
+
+    let mut shared = false;
+    for _ in 0..40 {
+        if h.exec_command("LIST_DEVICES").await.contains("state=shared") {
+            shared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(shared, "device stayed InUse after bridge kill");
+
+    // Immediate reattach succeeds
+    let s3 = connect_and_auth(ConnectOptions {
+        config_dir: cli_dir.path(),
+        target: &tcp_addr,
+        token: &token,
+        trust_fp: Some(&fp),
+        insecure_lan_plaintext: false,
+        client_name: "cli3",
+    })
+    .await
+    .unwrap();
+    let (_local_addr3, bridge3) = start_local_usbip_bridge(s3, "1-1").await.unwrap();
+    bridge3.abort();
+
+    daemon.shutdown().await;
+}

@@ -9,7 +9,9 @@ use portico_proto::frame::{
     PROTOCOL_VERSION_V0,
 };
 use portico_proto::relay_proto::{format_relay_uri, hash_slot_secret, RelayFrame};
-use portico_proto::tls::{build_client_tls_config, build_server_tls_config, CertCheckPolicy};
+use portico_proto::tls::{
+    build_client_tls_config, build_server_tls_config, configure_tunnel_tcp, CertCheckPolicy,
+};
 use portico_proto::token::verify_claim_token;
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -200,6 +202,7 @@ async fn run_tcp_accept_loop(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
+        configure_tunnel_tcp(&socket);
         let st = state.clone();
         let stop = stop_notify.clone();
         tokio::spawn(async move {
@@ -283,6 +286,7 @@ async fn run_relay_loop(
         let node_id = state.identity.read().await.node_id();
         let err_msg: String = match TcpStream::connect(&endpoint).await {
             Ok(mut ctrl) => {
+                configure_tunnel_tcp(&ctrl);
                 let reg = RelayFrame::ControlRegister {
                     node_id,
                     slot_secret_hash: secret_hash,
@@ -310,6 +314,7 @@ async fn run_relay_loop(
                                             let Ok(mut data) = TcpStream::connect(&ep).await else {
                                                 return;
                                             };
+                                            configure_tunnel_tcp(&data);
                                             let peer = data.peer_addr().unwrap_or_else(|_| {
                                                 SocketAddr::from(([0, 0, 0, 0], 0))
                                             });
@@ -394,6 +399,7 @@ async fn run_reverse_client_loop(
         };
 
         if let Ok(tcp) = TcpStream::connect(&addr).await {
+            configure_tunnel_tcp(&tcp);
             let peer = tcp
                 .peer_addr()
                 .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -533,6 +539,7 @@ where
                     let Ok(tcp) = TcpStream::connect(&addr_owned).await else {
                         return;
                     };
+                    configure_tunnel_tcp(&tcp);
                     let peer = tcp
                         .peer_addr()
                         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));

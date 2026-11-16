@@ -7,7 +7,7 @@
 //! They are based on the [Linux kernel documentation](https://docs.kernel.org/usb/usbip_protocol.html).
 
 use log::trace;
-use std::io::Result;
+use std::io::{IoSlice, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(feature = "serde")]
@@ -90,6 +90,7 @@ impl UsbIpHeaderBasic {
         result
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn read_from_socket_with_command<T: AsyncReadExt + Unpin>(
         socket: &mut T,
         command: u16,
@@ -145,7 +146,9 @@ impl UsbIpCommand {
     /// This will consume a variable amount of bytes from the socket.
     /// It might fail if the bytes does not follow the USB/IP protocol properly.
     pub async fn read_from_socket<T: AsyncReadExt + Unpin>(socket: &mut T) -> Result<UsbIpCommand> {
-        let version: u16 = socket.read_u16().await?;
+        let mut prefix = [0u8; 4];
+        socket.read_exact(&mut prefix).await?;
+        let version = u16::from_be_bytes([prefix[0], prefix[1]]);
 
         if version != 0 && version != USBIP_VERSION {
             return Err(std::io::Error::other(format!(
@@ -153,7 +156,7 @@ impl UsbIpCommand {
             )));
         }
 
-        let command: u16 = socket.read_u16().await?;
+        let command = u16::from_be_bytes([prefix[2], prefix[3]]);
 
         trace!(
             "Received command: {:#04X} ({}), parsing...",
@@ -175,31 +178,45 @@ impl UsbIpCommand {
                 Ok(UsbIpCommand::OpReqDevlist { status })
             }
             OP_REQ_IMPORT => {
-                let status = socket.read_u32().await?;
+                let mut buf = [0u8; 36];
+                socket.read_exact(&mut buf).await?;
+                let status = u32::from_be_bytes(buf[0..4].try_into().unwrap());
                 debug_assert!(status == 0);
-                let mut busid = [0; 32];
-                socket.read_exact(&mut busid).await?;
+                let busid: [u8; 32] = buf[4..36].try_into().unwrap();
 
                 Ok(UsbIpCommand::OpReqImport { status, busid })
             }
             USBIP_CMD_SUBMIT => {
-                let header =
-                    UsbIpHeaderBasic::read_from_socket_with_command(socket, USBIP_CMD_SUBMIT)
-                        .await?;
-                let transfer_flags = socket.read_u32().await?;
-                let transfer_buffer_length = socket.read_u32().await?;
-                let start_frame = socket.read_u32().await?;
-                let number_of_packets = socket.read_u32().await?;
-                let interval = socket.read_u32().await?;
-
-                let mut setup = [0; 8];
-                socket.read_exact(&mut setup).await?;
+                let mut hdr = [0u8; 44];
+                socket.read_exact(&mut hdr).await?;
+                let header = UsbIpHeaderBasic {
+                    command: USBIP_CMD_SUBMIT.into(),
+                    seqnum: u32::from_be_bytes(hdr[0..4].try_into().unwrap()),
+                    devid: u32::from_be_bytes(hdr[4..8].try_into().unwrap()),
+                    direction: u32::from_be_bytes(hdr[8..12].try_into().unwrap()),
+                    ep: u32::from_be_bytes(hdr[12..16].try_into().unwrap()),
+                };
+                debug_assert!(header.direction & 1 == header.direction);
+                let transfer_flags = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
+                let transfer_buffer_length = u32::from_be_bytes(hdr[20..24].try_into().unwrap());
+                let start_frame = u32::from_be_bytes(hdr[24..28].try_into().unwrap());
+                let number_of_packets = u32::from_be_bytes(hdr[28..32].try_into().unwrap());
+                let interval = u32::from_be_bytes(hdr[32..36].try_into().unwrap());
+                let setup: [u8; 8] = hdr[36..44].try_into().unwrap();
 
                 let data = if header.direction == Direction::In as u32 {
                     vec![]
                 } else {
+                    if transfer_buffer_length > 16 * 1024 * 1024 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("OUT transfer_buffer_length {transfer_buffer_length} exceeds 16 MiB cap"),
+                        ));
+                    }
                     let mut data = vec![0; transfer_buffer_length as usize];
-                    socket.read_exact(&mut data).await?;
+                    if !data.is_empty() {
+                        socket.read_exact(&mut data).await?;
+                    }
                     data
                 };
 
@@ -208,6 +225,12 @@ impl UsbIpCommand {
                 // https://stackoverflow.com/questions/76899798/usb-ip-what-is-the-size-of-the-iso-packet-descriptor
                 let iso_packet_descriptor =
                     if number_of_packets != 0 && number_of_packets != 0xFFFFFFFF {
+                        if number_of_packets > 65536 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("number_of_packets {number_of_packets} exceeds cap"),
+                            ));
+                        }
                         let mut result = vec![0; 16 * number_of_packets as usize];
                         socket.read_exact(&mut result).await?;
                         result
@@ -228,13 +251,17 @@ impl UsbIpCommand {
                 })
             }
             USBIP_CMD_UNLINK => {
-                let header =
-                    UsbIpHeaderBasic::read_from_socket_with_command(socket, USBIP_CMD_UNLINK)
-                        .await?;
-                let unlink_seqnum = socket.read_u32().await?;
-
-                let mut _padding = [0; 24];
-                socket.read_exact(&mut _padding).await?;
+                let mut hdr = [0u8; 44];
+                socket.read_exact(&mut hdr).await?;
+                let header = UsbIpHeaderBasic {
+                    command: USBIP_CMD_UNLINK.into(),
+                    seqnum: u32::from_be_bytes(hdr[0..4].try_into().unwrap()),
+                    devid: u32::from_be_bytes(hdr[4..8].try_into().unwrap()),
+                    direction: u32::from_be_bytes(hdr[8..12].try_into().unwrap()),
+                    ep: u32::from_be_bytes(hdr[12..16].try_into().unwrap()),
+                };
+                debug_assert!(header.direction & 1 == header.direction);
+                let unlink_seqnum = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
 
                 Ok(UsbIpCommand::UsbIpCmdUnlink {
                     header,
@@ -416,6 +443,62 @@ impl UsbIpResponse {
     }
 
     pub async fn write_to_socket<T: AsyncWriteExt + Unpin>(&self, socket: &mut T) -> Result<()> {
+        if let Self::UsbIpRetSubmit {
+            header,
+            status,
+            actual_length,
+            start_frame,
+            number_of_packets,
+            error_count,
+            transfer_buffer,
+            iso_packet_descriptor,
+        } = self
+        {
+            if transfer_buffer.len() > 4096 && iso_packet_descriptor.is_empty() {
+                debug_assert!(header.command == USBIP_RET_SUBMIT.into());
+                if header.direction == Direction::In as u32 {
+                    debug_assert!(*actual_length == transfer_buffer.len() as u32);
+                } else {
+                    debug_assert!(transfer_buffer.is_empty());
+                }
+                let mut hdr = [0u8; 48];
+                hdr[0..20].copy_from_slice(&header.to_bytes());
+                hdr[20..24].copy_from_slice(&status.to_be_bytes());
+                hdr[24..28].copy_from_slice(&actual_length.to_be_bytes());
+                hdr[28..32].copy_from_slice(&start_frame.to_be_bytes());
+                hdr[32..36].copy_from_slice(&number_of_packets.to_be_bytes());
+                hdr[36..40].copy_from_slice(&error_count.to_be_bytes());
+                let mut hdr_off = 0usize;
+                let mut buf_off = 0usize;
+                while hdr_off < hdr.len() || buf_off < transfer_buffer.len() {
+                    let n = if hdr_off < hdr.len() && buf_off < transfer_buffer.len() {
+                        let slices = [
+                            IoSlice::new(&hdr[hdr_off..]),
+                            IoSlice::new(&transfer_buffer[buf_off..]),
+                        ];
+                        socket.write_vectored(&slices).await?
+                    } else if hdr_off < hdr.len() {
+                        socket.write(&hdr[hdr_off..]).await?
+                    } else {
+                        socket.write(&transfer_buffer[buf_off..]).await?
+                    };
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to write whole vectored response",
+                        ));
+                    }
+                    let hdr_rem = hdr.len() - hdr_off;
+                    if n <= hdr_rem {
+                        hdr_off += n;
+                    } else {
+                        hdr_off = hdr.len();
+                        buf_off += n - hdr_rem;
+                    }
+                }
+                return Ok(());
+            }
+        }
         socket.write_all(&self.to_bytes()).await
     }
 
@@ -467,9 +550,14 @@ impl UsbIpResponse {
 
     /// Constructs a failed USBIP_RET_SUBMIT response
     pub fn usbip_ret_submit_fail(header: &UsbIpHeaderBasic) -> Self {
+        Self::usbip_ret_submit_err(header, 1)
+    }
+
+    /// Constructs a failed USBIP_RET_SUBMIT response with a specific USB/IP errno status (e.g. -32 for -EPIPE)
+    pub fn usbip_ret_submit_err(header: &UsbIpHeaderBasic, errno: i32) -> Self {
         Self::UsbIpRetSubmit {
             header: header.clone(),
-            status: 1,
+            status: errno as u32,
             actual_length: 0,
             start_frame: 0,
             number_of_packets: 0,

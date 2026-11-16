@@ -1,7 +1,7 @@
 use portico_proto::identity::NodeIdentity;
 use portico_proto::tls::{
-    build_client_tls_config, build_server_tls_config, is_lan_or_loopback_ip, CertCheckPolicy,
-    PinAllowlist,
+    build_client_tls_config, build_server_tls_config, configure_tunnel_tcp,
+    is_lan_or_loopback_ip, CertCheckPolicy, PinAllowlist,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -167,4 +167,38 @@ async fn mtls_requires_pinned_client_certificate() {
     }
 
     srv_task.abort();
+}
+
+#[tokio::test]
+async fn configure_tunnel_tcp_sets_nodelay_keepalive_and_user_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+    let cli = TcpStream::connect(addr).await.unwrap();
+    let srv = accept_task.await.unwrap();
+
+    configure_tunnel_tcp(&cli);
+    configure_tunnel_tcp(&srv);
+
+    assert!(cli.nodelay().unwrap());
+    assert!(srv.nodelay().unwrap());
+
+    let sock = socket2::SockRef::from(&srv);
+    assert!(sock.keepalive().unwrap());
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), 2);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(4))
+        );
+    }
 }

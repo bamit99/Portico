@@ -1,9 +1,10 @@
 use portico_proto::relay_proto::RelayFrame;
+use portico_proto::tls::configure_tunnel_tcp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
-use tokio::io::copy_bidirectional;
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -28,6 +29,7 @@ impl RelayServer {
         let state = Arc::new(Mutex::new(RelayState::default()));
         loop {
             let (stream, peer) = listener.accept().await?;
+            configure_tunnel_tcp(&stream);
             let st = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_conn(stream, st).await {
@@ -115,7 +117,13 @@ async fn handle_conn(
 
             let mut cli_stream = stream;
             let mut srv_stream = srv_stream;
-            let _ = copy_bidirectional(&mut cli_stream, &mut srv_stream).await;
+            let _ = copy_bidirectional_with_sizes(
+                &mut cli_stream,
+                &mut srv_stream,
+                128 * 1024,
+                128 * 1024,
+            )
+            .await;
         }
         RelayFrame::ServerAccept {
             node_id,

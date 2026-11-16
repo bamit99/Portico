@@ -615,6 +615,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "usbip",
 ]
 
 [[package]]
@@ -628,6 +629,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",

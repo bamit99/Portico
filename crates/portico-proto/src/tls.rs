@@ -7,6 +7,37 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Once, RwLock};
+use std::time::Duration;
+
+pub fn configure_tunnel_tcp(stream: &tokio::net::TcpStream) {
+    configure_tunnel_tcp_with(
+        stream,
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        2,
+        Duration::from_secs(4),
+    );
+}
+
+pub fn configure_tunnel_tcp_with(
+    stream: &tokio::net::TcpStream,
+    keepalive_idle: Duration,
+    keepalive_interval: Duration,
+    keepalive_retries: u32,
+    user_timeout: Duration,
+) {
+    let _ = stream.set_nodelay(true);
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(keepalive_idle)
+        .with_interval(keepalive_interval)
+        .with_retries(keepalive_retries);
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = sock_ref.set_tcp_user_timeout(Some(user_timeout));
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = user_timeout;
+}
 
 static CRYPTO_INIT: Once = Once::new();
 

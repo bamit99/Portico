@@ -221,7 +221,11 @@ where
                 let peer_label = format!("{client_name}@{peer_addr}");
                 match state.registry.try_claim_device(&bus_id, &peer_label).await {
                     Ok(claim) => {
-                        let _done_guard = ClaimDoneGuard(claim.done_tx.clone());
+                        let mut claim_guard = TunnelClaimGuard::new(
+                            state.clone(),
+                            bus_id.clone(),
+                            claim.done_tx.clone(),
+                        );
                         if let Err(e) = write_frame(
                             &mut stream,
                             &Frame::OpenTunnelResp {
@@ -232,8 +236,7 @@ where
                         .await
                         {
                             drop(claim);
-                            let ignored = state.config.lock().await.config.ignored_devices.clone();
-                            state.registry.release_claim(&bus_id, &ignored).await;
+                            claim_guard.release_now().await;
                             return Err(e.into());
                         }
 
@@ -244,8 +247,7 @@ where
                             stop_notify.clone(),
                         )
                         .await;
-                        let ignored = state.config.lock().await.config.ignored_devices.clone();
-                        state.registry.release_claim(&bus_id, &ignored).await;
+                        claim_guard.release_now().await;
                         return res;
                     }
                     Err(status) => {
@@ -298,7 +300,8 @@ where
     let peer_label = format!("reverse@{peer_addr}");
     match state.registry.try_claim_device(bus_id, &peer_label).await {
         Ok(claim) => {
-            let _done_guard = ClaimDoneGuard(claim.done_tx.clone());
+            let mut claim_guard =
+                TunnelClaimGuard::new(state.clone(), bus_id.to_string(), claim.done_tx.clone());
             if let Err(e) = write_frame(
                 &mut stream,
                 &Frame::OpenTunnelResp {
@@ -309,8 +312,7 @@ where
             .await
             {
                 drop(claim);
-                let ignored = state.config.lock().await.config.ignored_devices.clone();
-                state.registry.release_claim(bus_id, &ignored).await;
+                claim_guard.release_now().await;
                 return Err(e.into());
             }
             let res = run_tunnel_with_cancel(
@@ -320,8 +322,7 @@ where
                 stop_notify,
             )
             .await;
-            let ignored = state.config.lock().await.config.ignored_devices.clone();
-            state.registry.release_claim(bus_id, &ignored).await;
+            claim_guard.release_now().await;
             res
         }
         Err(status) => {
@@ -338,11 +339,54 @@ where
     }
 }
 
-struct ClaimDoneGuard(Arc<tokio::sync::watch::Sender<bool>>);
+struct TunnelClaimGuard {
+    state: Arc<DaemonState>,
+    bus_id: String,
+    done_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    released: bool,
+}
 
-impl Drop for ClaimDoneGuard {
+impl TunnelClaimGuard {
+    fn new(
+        state: Arc<DaemonState>,
+        bus_id: String,
+        done_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    ) -> Self {
+        Self {
+            state,
+            bus_id,
+            done_tx,
+            released: false,
+        }
+    }
+
+    async fn release_now(&mut self) {
+        if !self.released {
+            self.released = true;
+            let ignored = self.state.config.lock().await.config.ignored_devices.clone();
+            self.state.registry.release_claim(&self.bus_id, &ignored).await;
+            let _ = self.done_tx.send(true);
+        }
+    }
+}
+
+impl Drop for TunnelClaimGuard {
     fn drop(&mut self) {
-        let _ = self.0.send(true);
+        if !self.released {
+            self.released = true;
+            let state = self.state.clone();
+            let bus_id = self.bus_id.clone();
+            let done_tx = self.done_tx.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let ignored = state.config.lock().await.config.ignored_devices.clone();
+                    state.registry.release_claim(&bus_id, &ignored).await;
+                    let _ = done_tx.send(true);
+                });
+            } else {
+                let _ = done_tx.send(true);
+            }
+        }
     }
 }
 

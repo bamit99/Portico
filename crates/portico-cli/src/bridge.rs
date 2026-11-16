@@ -1,8 +1,9 @@
 use crate::transport::AuthenticatedStream;
 use crate::CliError;
 use portico_proto::frame::{read_frame, write_frame, Frame, TunnelStatus};
+use portico_proto::tls::configure_tunnel_tcp;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::io::copy_bidirectional;
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -49,7 +50,8 @@ pub async fn bridge_already_open_tunnel(
 
     let handle = tokio::spawn(async move {
         let (mut local_tcp, _) = listener.accept().await?;
-        let _ = copy_bidirectional(&mut local_tcp, &mut remote_stream).await?;
+        configure_tunnel_tcp(&local_tcp);
+        let _ = copy_bidirectional_with_sizes(&mut local_tcp, &mut remote_stream, 128 * 1024, 128 * 1024).await?;
         Ok(())
     });
     Ok((local_addr, handle))
