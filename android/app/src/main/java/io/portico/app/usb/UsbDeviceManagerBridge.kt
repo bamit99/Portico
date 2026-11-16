@@ -11,14 +11,20 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import androidx.core.content.ContextCompat
 import io.portico.app.nativebridge.PorticoNative
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
 class UsbDeviceManagerBridge(
     private val context: Context,
+    private val scope: CoroutineScope,
+    private val daemonDispatcher: CoroutineDispatcher,
     private val onDevicesChanged: () -> Unit,
 ) {
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val openConnections = ConcurrentHashMap<String, UsbDeviceConnection>()
+    private val promptedBusIds = ConcurrentHashMap.newKeySet<String>()
     private var registered = false
 
     private val receiver = object : BroadcastReceiver() {
@@ -28,46 +34,60 @@ class UsbDeviceManagerBridge(
                     val device = extractUsbDevice(intent) ?: return
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                     if (granted) {
-                        openAndAttach(device)
+                        scope.launch(daemonDispatcher) {
+                            openAndAttach(device)
+                            onDevicesChanged()
+                        }
                     }
-                    onDevicesChanged()
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = extractUsbDevice(intent) ?: return
-                    handleDeviceAttached(device)
-                    onDevicesChanged()
+                    scope.launch(daemonDispatcher) {
+                        handleDeviceAttached(device, forcePrompt = false)
+                        onDevicesChanged()
+                    }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val device = extractUsbDevice(intent) ?: return
-                    detachDevice(device)
-                    onDevicesChanged()
+                    promptedBusIds.remove(busIdFor(device))
+                    scope.launch(daemonDispatcher) {
+                        detachDevice(device)
+                        onDevicesChanged()
+                    }
                 }
             }
         }
     }
 
     fun start() {
-        if (registered) return
-        val filter = IntentFilter().apply {
-            addAction(ACTION_USB_PERMISSION)
-            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        if (!registered) {
+            val filter = IntentFilter().apply {
+                addAction(ACTION_USB_PERMISSION)
+                addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+                addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            }
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            registered = true
         }
-        ContextCompat.registerReceiver(
-            context,
-            receiver,
-            filter,
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-        registered = true
-        scanAttachedDevices()
+        scope.launch(daemonDispatcher) {
+            scanAttachedDevicesBlocking()
+            onDevicesChanged()
+        }
     }
 
-    fun stop() {
+    fun unregisterReceiverOnly() {
         if (registered) {
             runCatching { context.unregisterReceiver(receiver) }
             registered = false
         }
+    }
+
+    fun closeConnectionsBlocking() {
         for ((busId, conn) in openConnections.entries.toList()) {
             PorticoNative.nativeDetachUsb(busId)
             runCatching { conn.close() }
@@ -75,11 +95,29 @@ class UsbDeviceManagerBridge(
         }
     }
 
-    fun scanAttachedDevices() {
+    fun rescanAsync() {
+        scope.launch(daemonDispatcher) {
+            scanAttachedDevicesBlocking()
+            onDevicesChanged()
+        }
+    }
+
+    fun requestPermissionForBus(busId: String) {
+        scope.launch(daemonDispatcher) {
+            val dev = usbManager.deviceList.values.firstOrNull { busIdFor(it) == busId } ?: return@launch
+            if (usbManager.hasPermission(dev)) {
+                openAndAttach(dev)
+                onDevicesChanged()
+            } else {
+                requestPermission(dev)
+            }
+        }
+    }
+
+    private fun scanAttachedDevicesBlocking() {
         val current = usbManager.deviceList.values.toList()
         val currentBusIds = current.map { busIdFor(it) }.toSet()
 
-        // Detach any disappeared devices cleanly before closing fds
         for (busId in openConnections.keys.toList()) {
             if (busId !in currentBusIds) {
                 PorticoNative.nativeDetachUsb(busId)
@@ -88,21 +126,11 @@ class UsbDeviceManagerBridge(
         }
 
         for (dev in current) {
-            handleDeviceAttached(dev)
+            handleDeviceAttached(dev, forcePrompt = false)
         }
     }
 
-    fun requestPermissionForBus(busId: String) {
-        val dev = usbManager.deviceList.values.firstOrNull { busIdFor(it) == busId } ?: return
-        if (usbManager.hasPermission(dev)) {
-            openAndAttach(dev)
-            onDevicesChanged()
-        } else {
-            requestPermission(dev)
-        }
-    }
-
-    private fun handleDeviceAttached(device: UsbDevice) {
+    private fun handleDeviceAttached(device: UsbDevice, forcePrompt: Boolean) {
         val busId = busIdFor(device)
         if (openConnections.containsKey(busId)) return
         if (usbManager.hasPermission(device)) {
@@ -110,7 +138,12 @@ class UsbDeviceManagerBridge(
         } else {
             val product = device.productName ?: "USB Device"
             PorticoNative.nativeRegisterPendingUsb(busId, device.vendorId, device.productId, product)
-            requestPermission(device)
+            if (PorticoNative.nativeIsVidPidIgnored(device.vendorId, device.productId)) {
+                return
+            }
+            if (forcePrompt || promptedBusIds.add(busId)) {
+                requestPermission(device)
+            }
         }
     }
 

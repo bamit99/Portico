@@ -7,25 +7,23 @@ use portico_core::usb_handler::usb_device_from_rusb_handle;
 use portico_core::CoreError;
 use rusb::UsbContext;
 use std::path::PathBuf;
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use tokio::runtime::Runtime;
 use tracing::error;
 
-static DISCOVERY_DISABLED: Once = Once::new();
+static DISCOVERY_DISABLED: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub fn init_fd_usb_context() -> Result<rusb::Context, CoreError> {
     #[cfg(unix)]
     {
-        let mut init_err: Option<rusb::Error> = None;
-        DISCOVERY_DISABLED.call_once(|| {
+        // Only cache success; retry if an earlier call failed
+        if DISCOVERY_DISABLED.get().is_none() {
             if let Err(e) = rusb::disable_device_discovery() {
-                init_err = Some(e);
+                return Err(CoreError::Usb(format!(
+                    "disable_device_discovery failed: {e}"
+                )));
             }
-        });
-        if let Some(e) = init_err {
-            return Err(CoreError::Usb(format!(
-                "disable_device_discovery failed: {e}"
-            )));
+            let _ = DISCOVERY_DISABLED.set(Ok(()));
         }
     }
     rusb::Context::new().map_err(|e| CoreError::Usb(format!("rusb Context::new: {e}")))
@@ -69,26 +67,38 @@ pub async fn attach_usb_fd(
         .await
 }
 
-struct GlobalDaemon {
-    rt: Runtime,
-    daemon: Option<PorticoDaemon>,
-    usb_ctx: Option<rusb::Context>,
+struct DaemonSlot {
+    daemon: PorticoDaemon,
+    handle: DaemonHandle,
+    usb_ctx: rusb::Context,
 }
 
-static GLOBAL: OnceLock<Mutex<GlobalDaemon>> = OnceLock::new();
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static DAEMON_SLOT: OnceLock<Mutex<Option<DaemonSlot>>> = OnceLock::new();
 
-fn global_state() -> &'static Mutex<GlobalDaemon> {
-    GLOBAL.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+fn runtime() -> &'static Runtime {
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("tokio runtime");
-        Mutex::new(GlobalDaemon {
-            rt,
-            daemon: None,
-            usb_ctx: None,
-        })
+            .expect("tokio runtime")
     })
+}
+
+fn slot_mutex() -> &'static Mutex<Option<DaemonSlot>> {
+    DAEMON_SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn clone_handle_and_ctx() -> Option<(DaemonHandle, rusb::Context)> {
+    let guard = slot_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .map(|s| (s.handle.clone(), s.usb_ctx.clone()))
+}
+
+fn clone_handle() -> Option<DaemonHandle> {
+    let guard = slot_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|s| s.handle.clone())
 }
 
 fn get_jstring(env: &mut JNIEnv, s: JString) -> Option<String> {
@@ -112,8 +122,7 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeStar
         let Some(ctrl_sock) = get_jstring(&mut env, ctrl_sock_path) else {
             return false;
         };
-        let mut g = global_state().lock().unwrap();
-        if g.daemon.is_some() {
+        if clone_handle().is_some() {
             return true;
         }
         let ctx = match init_fd_usb_context() {
@@ -123,20 +132,29 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeStar
                 return false;
             }
         };
-        match g.rt.block_on(PorticoDaemon::start(
+        let daemon = match runtime().block_on(PorticoDaemon::start(
             PathBuf::from(data_dir),
             PathBuf::from(ctrl_sock),
         )) {
-            Ok(d) => {
-                g.usb_ctx = Some(ctx);
-                g.daemon = Some(d);
-                true
-            }
+            Ok(d) => d,
             Err(e) => {
                 error!("PorticoDaemon::start: {e}");
-                false
+                return false;
             }
+        };
+        let handle = daemon.handle();
+        let mut guard = slot_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            drop(guard);
+            runtime().block_on(daemon.shutdown());
+            return true;
         }
+        *guard = Some(DaemonSlot {
+            daemon,
+            handle,
+            usb_ctx: ctx,
+        });
+        true
     }));
     if matches!(res, Ok(true)) {
         JNI_TRUE
@@ -151,9 +169,12 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeStop
     _class: JClass,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut g = global_state().lock().unwrap();
-        if let Some(d) = g.daemon.take() {
-            g.rt.block_on(d.shutdown());
+        let taken = {
+            let mut guard = slot_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(slot) = taken {
+            runtime().block_on(slot.daemon.shutdown());
         }
     }));
 }
@@ -173,13 +194,10 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeAtta
             return false;
         };
         let fallback = get_jstring(&mut env, fallback_product);
-        let g = global_state().lock().unwrap();
-        let (Some(daemon), Some(ctx)) = (g.daemon.as_ref(), g.usb_ctx.as_ref()) else {
+        let Some((handle, ctx)) = clone_handle_and_ctx() else {
             return false;
         };
-        let handle = daemon.handle();
-        let ctx = ctx.clone();
-        g.rt
+        runtime()
             .block_on(attach_usb_fd(
                 &handle,
                 &ctx,
@@ -212,18 +230,44 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeRegi
             return false;
         };
         let product = get_jstring(&mut env, product).unwrap_or_else(|| "USB Device".into());
-        let g = global_state().lock().unwrap();
-        let Some(daemon) = g.daemon.as_ref() else {
+        let Some(handle) = clone_handle() else {
             return false;
         };
-        let handle = daemon.handle();
-        g.rt.block_on(handle.state.registry.register_pending_permission(
+        runtime().block_on(handle.state.registry.register_pending_permission(
             bus_id,
             vid as u16,
             pid as u16,
             product,
         ));
         true
+    }));
+    if matches!(res, Ok(true)) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeIsVidPidIgnored(
+    _env: JNIEnv,
+    _class: JClass,
+    vid: jint,
+    pid: jint,
+) -> jboolean {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(handle) = clone_handle() else {
+            return false;
+        };
+        let v = vid as u16;
+        let p = pid as u16;
+        runtime().block_on(async move {
+            let cfg = handle.state.config.lock().await;
+            cfg.config
+                .ignored_devices
+                .iter()
+                .any(|vp| vp.vid == v && vp.pid == p)
+        })
     }));
     if matches!(res, Ok(true)) {
         JNI_TRUE
@@ -242,12 +286,10 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeDeta
         let Some(bus_id) = get_jstring(&mut env, bus_id) else {
             return false;
         };
-        let g = global_state().lock().unwrap();
-        let Some(daemon) = g.daemon.as_ref() else {
+        let Some(handle) = clone_handle() else {
             return false;
         };
-        let handle = daemon.handle();
-        g.rt
+        runtime()
             .block_on(handle.state.registry.detach_device(&bus_id))
             .is_ok()
     }));
@@ -268,12 +310,10 @@ pub extern "system" fn Java_io_portico_app_nativebridge_PorticoNative_nativeExec
         let Some(cmd_str) = get_jstring(&mut env, cmd) else {
             return "ERR null_cmd".to_string();
         };
-        let g = global_state().lock().unwrap();
-        let Some(daemon) = g.daemon.as_ref() else {
+        let Some(handle) = clone_handle() else {
             return "ERR daemon_not_running".to_string();
         };
-        let handle = daemon.handle();
-        g.rt.block_on(handle.exec_command(&cmd_str))
+        runtime().block_on(handle.exec_command(&cmd_str))
     }))
     .unwrap_or_else(|_| "ERR panic".to_string());
 

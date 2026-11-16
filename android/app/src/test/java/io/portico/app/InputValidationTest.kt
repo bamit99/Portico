@@ -35,5 +35,8 @@ class InputValidationTest {
         assertNull(Validation.parseReverseClient("no-port", "a".repeat(64)))
         assertNull(Validation.parseReverseClient("192.168.1.10:37425", "deadbeef"))
         assertNull(Validation.parseReverseClient("192.168.1.10:99999", "a".repeat(64)))
+        assertNull(Validation.parseReverseClient("a,b:37425", "a".repeat(64)))
+        assertNull(Validation.parseReverseClient("u@h:37425", "a".repeat(64)))
+        assertNull(Validation.parseReverseClient("host name:37425", "a".repeat(64)))
     }
 }

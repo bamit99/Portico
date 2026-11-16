@@ -4,7 +4,7 @@ use crate::CoreError;
 use portico_proto::frame::{DeviceSummary, TunnelStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 use usbip::{UsbDevice, UsbIpServer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,12 +70,14 @@ pub struct ClaimedDevice {
     pub bus_id: String,
     pub usbip_server: Arc<UsbIpServer>,
     pub cancel: Arc<Notify>,
+    pub done_tx: Arc<watch::Sender<bool>>,
 }
 
 struct RegisteredEntry {
     record: DeviceRecord,
     usb_device: Option<UsbDevice>,
     active_cancel: Option<Arc<Notify>>,
+    active_done_rx: Option<watch::Receiver<bool>>,
 }
 
 pub struct DeviceRegistry {
@@ -144,12 +146,23 @@ impl DeviceRegistry {
             state: state.clone(),
         };
 
+        let mut wait_done: Option<(Arc<Notify>, watch::Receiver<bool>)> = None;
         let mut guard = self.devices.lock().await;
         if let Some(prev) = guard.remove(&bus_id) {
-            if let Some(cancel) = prev.active_cancel {
-                cancel.notify_waiters();
+            if let (Some(cancel), Some(done_rx)) = (prev.active_cancel, prev.active_done_rx) {
+                wait_done = Some((cancel, done_rx));
             }
         }
+        drop(guard);
+        if let Some((cancel, mut done_rx)) = wait_done {
+            cancel.notify_waiters();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                done_rx.wait_for(|&done| done),
+            )
+            .await;
+        }
+        let mut guard = self.devices.lock().await;
         let _ = self.usbip.remove_device(&bus_id).await;
         if !is_ign {
             self.usbip.add_device(dev.clone()).await;
@@ -161,6 +174,7 @@ impl DeviceRegistry {
                 record: record.clone(),
                 usb_device: Some(dev),
                 active_cancel: None,
+                active_done_rx: None,
             },
         );
         drop(guard);
@@ -201,6 +215,7 @@ impl DeviceRegistry {
                 record: record.clone(),
                 usb_device: None,
                 active_cancel: None,
+                active_done_rx: None,
             },
         );
         self.emit(DaemonEvent::DeviceAdded {
@@ -221,11 +236,40 @@ impl DeviceRegistry {
         if let Some(cancel) = entry.active_cancel {
             cancel.notify_waiters();
         }
+        if let Some(mut done_rx) = entry.active_done_rx {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                done_rx.wait_for(|&done| done),
+            )
+            .await;
+        }
         let _ = self.usbip.remove_device(bus_id).await;
         self.emit(DaemonEvent::DeviceRemoved {
             bus_id: bus_id.to_string(),
         });
         Ok(entry.record)
+    }
+
+    pub async fn cancel_claim(&self, bus_id: &str, ignored: &[VidPid]) -> Result<(), CoreError> {
+        let (cancel, done_rx) = {
+            let guard = self.devices.lock().await;
+            let Some(entry) = guard.get(bus_id) else {
+                return Err(CoreError::NotFound(format!("device {bus_id} not found")));
+            };
+            (entry.active_cancel.clone(), entry.active_done_rx.clone())
+        };
+        if let Some(c) = cancel {
+            c.notify_waiters();
+        }
+        if let Some(mut rx) = done_rx {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                rx.wait_for(|&done| done),
+            )
+            .await;
+        }
+        self.release_claim(bus_id, ignored).await;
+        Ok(())
     }
 
     pub async fn apply_ignored_list(&self, ignored: &[VidPid]) -> Result<(), CoreError> {
@@ -317,8 +361,11 @@ impl DeviceRegistry {
         };
         let tunnel_server = Arc::new(UsbIpServer::new_simulated(vec![dev.clone()]));
         let cancel = Arc::new(Notify::new());
+        let (done_tx, done_rx) = watch::channel(false);
+        let done_tx = Arc::new(done_tx);
         entry.record.state = DeviceState::InUse(peer.to_string());
         entry.active_cancel = Some(cancel.clone());
+        entry.active_done_rx = Some(done_rx);
         drop(guard);
 
         self.emit(DaemonEvent::DeviceState {
@@ -331,6 +378,7 @@ impl DeviceRegistry {
             bus_id: bus_id.to_string(),
             usbip_server: tunnel_server,
             cancel,
+            done_tx,
         })
     }
 
@@ -341,6 +389,7 @@ impl DeviceRegistry {
                 return;
             };
             entry.active_cancel = None;
+            entry.active_done_rx = None;
             if Self::is_ignored(entry.record.vid, entry.record.pid, ignored) {
                 let _ = self.usbip.remove_device(bus_id).await;
                 entry.record.state = DeviceState::Ignored;

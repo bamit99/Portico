@@ -98,16 +98,42 @@ async fn ignored_devices_never_auto_shared_and_toggle_updates_usbip_server() {
         reg.try_claim_device("1-3", "peerB").await.err(),
         Some(TunnelStatus::InUse)
     );
-    // Detach while InUse triggers cancel token and removes device
+    // Detach while InUse triggers cancel token, waits for tunnel drop, and removes device
     let notified = claim1.cancel.clone();
-    let waiter = tokio::spawn(async move { notified.notified().await });
+    let done_tx = claim1.done_tx.clone();
+    let waiter = tokio::spawn(async move {
+        notified.notified().await;
+        let _ = done_tx.send(true);
+    });
     tokio::task::yield_now().await;
     reg.detach_device("1-3").await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-        .await
-        .expect("cancel notify must fire on detach")
-        .unwrap();
+    waiter.await.unwrap();
     assert!(reg.list_devices().await.iter().all(|d| d.bus_id != "1-3"));
+
+    // cancel_claim releases InUse device back to Shared without removing it
+    let d4 = make_sim_cdc("1-4", 0xCCCC, 0xDDDD);
+    reg.register_usb_device(d4, "M".into(), "P4".into(), "S4".into(), &[])
+        .await
+        .unwrap();
+    let claim4 = reg.try_claim_device("1-4", "peerC").await.unwrap();
+    let c4_notified = claim4.cancel.clone();
+    let c4_done = claim4.done_tx.clone();
+    let w4 = tokio::spawn(async move {
+        c4_notified.notified().await;
+        let _ = c4_done.send(true);
+    });
+    tokio::task::yield_now().await;
+    reg.cancel_claim("1-4", &[]).await.unwrap();
+    w4.await.unwrap();
+    assert_eq!(
+        reg.list_devices()
+            .await
+            .into_iter()
+            .find(|d| d.bus_id == "1-4")
+            .unwrap()
+            .state,
+        DeviceState::Shared
+    );
 
     assert_eq!(validate_in_transfer_len(1024).unwrap(), 1024);
     assert!(validate_in_transfer_len(MAX_USB_TRANSFER_LEN + 1).is_err());

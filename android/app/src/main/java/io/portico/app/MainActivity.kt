@@ -48,7 +48,9 @@ class MainActivity : ComponentActivity() {
         }
 
         val svcIntent = Intent(this, PorticoService::class.java).apply {
-            action = PorticoService.ACTION_START_AND_SHARE
+            if (savedInstanceState == null) {
+                action = PorticoService.ACTION_START_AND_SHARE
+            }
         }
         ContextCompat.startForegroundService(this, svcIntent)
         bindService(svcIntent, connection, Context.BIND_AUTO_CREATE)
@@ -59,6 +61,7 @@ class MainActivity : ComponentActivity() {
                 MainScreen(
                     viewModel = viewModel,
                     onExitApp = {
+                        viewModel.detachService()
                         if (bound) {
                             unbindService(connection)
                             bound = false
@@ -72,6 +75,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        viewModel.detachService()
         if (bound) {
             unbindService(connection)
             bound = false

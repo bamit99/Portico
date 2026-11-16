@@ -22,6 +22,7 @@ object PorticoNative {
         product: String
     ): Boolean
 
+    external fun nativeIsVidPidIgnored(vid: Int, pid: Int): Boolean
     external fun nativeDetachUsb(busId: String): Boolean
     external fun nativeExecControl(cmd: String): String
 }

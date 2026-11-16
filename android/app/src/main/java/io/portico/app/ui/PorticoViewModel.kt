@@ -31,6 +31,7 @@ data class PorticoUiState(
     val logs: List<LogItem> = emptyList(),
     val claimToken: String = "",
     val lanIp: String = "127.0.0.1",
+    val relayEnabled: Boolean = false,
     val relayEndpointDraft: String = "",
     val toastMessage: String? = null,
 )
@@ -54,7 +55,13 @@ object PorticoStateReducer {
             "SERVER_STATE" -> {
                 val running = ev.fields["running"] == "true"
                 val port = ev.fields["port"]?.toIntOrNull() ?: current.daemon.port
-                current.copy(daemon = current.daemon.copy(running = running, serverActive = running, port = port))
+                current.copy(
+                    daemon = current.daemon.copy(
+                        running = running,
+                        serverActive = running,
+                        port = port,
+                    ),
+                )
             }
             "RELAY_STATE" -> {
                 val st = ev.fields["status"] ?: current.daemon.relayStatus
@@ -97,6 +104,7 @@ object PorticoStateReducer {
             }
             "LOG" -> {
                 val seq = ev.fields["seq"]?.toLongOrNull() ?: return current
+                if (current.logs.any { it.seq == seq }) return current
                 val entry = LogItem(
                     seq = seq,
                     timestampMs = ev.fields["ts"]?.toLongOrNull() ?: 0L,
@@ -128,14 +136,20 @@ class PorticoViewModel : ViewModel() {
         eventJob?.cancel()
         eventJob = viewModelScope.launch {
             c.subscribeEvents().collect { ev ->
-                _uiState.update { PorticoStateReducer.applyEvent(it, ev) }
-                if (ev.type == "LOCK_CHANGED" || ev.type == "SERVER_STATE") {
-                    val st = _uiState.value.daemon
-                    serviceRef?.applyLocks(st.netLock, st.wakeLock, st.running)
+                if (ev.type == "RECONNECTED") {
+                    refreshAll()
+                } else {
+                    _uiState.update { PorticoStateReducer.applyEvent(it, ev) }
                 }
             }
         }
         refreshAll()
+    }
+
+    fun detachService() {
+        eventJob?.cancel()
+        eventJob = null
+        serviceRef = null
     }
 
     fun clearToast() {
@@ -162,7 +176,8 @@ class PorticoViewModel : ViewModel() {
                 if (stateReply is ControlReply.Ok) {
                     val snap = ControlChannelParser.parseState(stateReply.line)
                     next = next.copy(connected = true, daemon = snap)
-                    serviceRef?.applyLocks(snap.netLock, snap.wakeLock, snap.running)
+                } else if (stateReply is ControlReply.Err) {
+                    next = next.copy(connected = false)
                 }
                 if (devReply is ControlReply.Ok) {
                     next = next.copy(devices = ControlChannelParser.parseDevices(devReply.items))
@@ -181,7 +196,8 @@ class PorticoViewModel : ViewModel() {
                         relayReply.line.removePrefix("OK ").trim().split(' ').filter { it.isNotEmpty() },
                     )
                     val ep = kv["endpoint"].orEmpty().let { if (it == "-") "" else it }
-                    next = next.copy(relayEndpointDraft = ep)
+                    val en = kv["enabled"] == "true"
+                    next = next.copy(relayEnabled = en, relayEndpointDraft = ep)
                 }
                 if (logsReply is ControlReply.Ok) {
                     next = next.copy(logs = ControlChannelParser.parseLogs(logsReply.items))
@@ -204,20 +220,15 @@ class PorticoViewModel : ViewModel() {
     fun setNetLock(enabled: Boolean) = runControl("SET_NET_LOCK $enabled")
     fun setWakeLock(enabled: Boolean) = runControl("SET_WAKE_LOCK $enabled")
     fun setPlaintextLan(enabled: Boolean) = runControl("SET_STATE plaintext_lan $enabled")
+    fun setUsbSpeed(speed: String) = runControl("SET_SPEED $speed", "USB speed set to $speed")
 
     fun setRelay(enabled: Boolean, endpoint: String) {
-        val c = client ?: return
-        viewModelScope.launch {
-            val cmd = if (endpoint.trim().isNotEmpty()) {
-                "SET_RELAY $enabled ${endpoint.trim()}"
-            } else {
-                "SET_RELAY $enabled"
-            }
-            when (val r = c.sendCommand(cmd)) {
-                is ControlReply.Ok -> refreshAll()
-                is ControlReply.Err -> showToast(r.message.ifBlank { r.code })
-            }
+        val cmd = if (endpoint.trim().isNotEmpty()) {
+            "SET_RELAY $enabled ${endpoint.trim()}"
+        } else {
+            "SET_RELAY $enabled"
         }
+        runControl(cmd)
     }
 
     fun setIgnoredDevices(list: List<String>) {
@@ -244,8 +255,9 @@ class PorticoViewModel : ViewModel() {
         runControl("SET_REVERSE_CLIENTS $arg")
     }
 
-    fun regenToken() = runControl("REGEN_TOKEN")
-    fun rotateIdentity() = runControl("ROTATE_IDENTITY")
+    fun releaseDevice(busId: String) = runControl("RELEASE_DEVICE $busId", "Released $busId")
+    fun regenToken() = runControl("REGEN_TOKEN", "Regenerated claim token")
+    fun rotateIdentity() = runControl("ROTATE_IDENTITY", "Rotated server identity")
     fun clearLogs() = runControl("CLEAR_LOGS")
 
     fun requestUsbPermission(busId: String) {
@@ -265,11 +277,14 @@ class PorticoViewModel : ViewModel() {
         }
     }
 
-    private fun runControl(cmd: String) {
+    private fun runControl(cmd: String, successToast: String? = null) {
         val c = client ?: return
         viewModelScope.launch {
             when (val r = c.sendCommand(cmd)) {
-                is ControlReply.Ok -> refreshAll()
+                is ControlReply.Ok -> {
+                    if (successToast != null) showToast(successToast)
+                    refreshAll()
+                }
                 is ControlReply.Err -> showToast(r.message.ifBlank { r.code })
             }
         }
@@ -278,8 +293,16 @@ class PorticoViewModel : ViewModel() {
     companion object {
         fun detectLanIp(): String {
             return runCatching {
-                NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+                val interfaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
                     .filter { it.isUp && !it.isLoopback }
+                    .sortedBy { iface ->
+                        when {
+                            iface.name.startsWith("wlan") -> 0
+                            iface.name.startsWith("eth") -> 1
+                            else -> 2
+                        }
+                    }
+                interfaces
                     .flatMap { it.inetAddresses.toList() }
                     .filterIsInstance<Inet4Address>()
                     .firstOrNull { !it.isLoopbackAddress }

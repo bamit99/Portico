@@ -11,8 +11,7 @@ object BootPolicy {
 
     fun shouldStartOnAction(action: String?, bootEnabled: Boolean): Boolean {
         if (!bootEnabled) return false
-        return action == Intent.ACTION_BOOT_COMPLETED ||
-            action == Intent.ACTION_LOCKED_BOOT_COMPLETED
+        return action == Intent.ACTION_BOOT_COMPLETED
     }
 
     fun setStartOnBoot(context: Context, enabled: Boolean) {

@@ -52,5 +52,15 @@ class ViewModelStateTest {
         )
         assertEquals(1, removed.devices.size)
         assertFalse(removed.devices.any { it.busId == "1-1" })
+
+        val logged1 = PorticoStateReducer.applyEvent(
+            removed,
+            ControlEvent("LOG", mapOf("seq" to "10", "ts" to "1", "level" to "INFO", "target" to "t", "msg" to "hi")),
+        )
+        val loggedDup = PorticoStateReducer.applyEvent(
+            logged1,
+            ControlEvent("LOG", mapOf("seq" to "10", "ts" to "1", "level" to "INFO", "target" to "t", "msg" to "hi")),
+        )
+        assertEquals(1, loggedDup.logs.size)
     }
 }

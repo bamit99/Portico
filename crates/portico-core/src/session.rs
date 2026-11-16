@@ -221,6 +221,7 @@ where
                 let peer_label = format!("{client_name}@{peer_addr}");
                 match state.registry.try_claim_device(&bus_id, &peer_label).await {
                     Ok(claim) => {
+                        let _done_guard = ClaimDoneGuard(claim.done_tx.clone());
                         if let Err(e) = write_frame(
                             &mut stream,
                             &Frame::OpenTunnelResp {
@@ -230,6 +231,7 @@ where
                         )
                         .await
                         {
+                            drop(claim);
                             let ignored = state.config.lock().await.config.ignored_devices.clone();
                             state.registry.release_claim(&bus_id, &ignored).await;
                             return Err(e.into());
@@ -296,6 +298,7 @@ where
     let peer_label = format!("reverse@{peer_addr}");
     match state.registry.try_claim_device(bus_id, &peer_label).await {
         Ok(claim) => {
+            let _done_guard = ClaimDoneGuard(claim.done_tx.clone());
             if let Err(e) = write_frame(
                 &mut stream,
                 &Frame::OpenTunnelResp {
@@ -305,6 +308,7 @@ where
             )
             .await
             {
+                drop(claim);
                 let ignored = state.config.lock().await.config.ignored_devices.clone();
                 state.registry.release_claim(bus_id, &ignored).await;
                 return Err(e.into());
@@ -331,6 +335,14 @@ where
             .await?;
             Ok(())
         }
+    }
+}
+
+struct ClaimDoneGuard(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Drop for ClaimDoneGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
     }
 }
 

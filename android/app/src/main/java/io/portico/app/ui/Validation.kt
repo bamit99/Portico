@@ -37,6 +37,7 @@ object Validation {
 
     fun parseReverseClient(addrInput: String, fpInput: String): Pair<String, String>? {
         val addr = addrInput.trim()
+        if (addr.any { it == ',' || it == '@' || it.isWhitespace() }) return null
         val colon = addr.lastIndexOf(':')
         if (colon <= 0 || colon >= addr.length - 1) return null
         val host = addr.substring(0, colon)

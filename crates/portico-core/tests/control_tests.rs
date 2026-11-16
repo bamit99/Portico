@@ -149,6 +149,11 @@ async fn control_channel_covers_all_commands_and_subscribe_events() {
 
     assert_eq!(send_cmd(&mut cr, &mut cw, "DETACH_DEVICE 1-9").await[0], "OK");
     assert_eq!(send_cmd(&mut cr, &mut cw, "LIST_DEVICES").await, vec!["OK 0", "END"]);
+    assert!(
+        send_cmd(&mut cr, &mut cw, "RELEASE_DEVICE 1-9")
+            .await[0]
+            .starts_with("ERR ")
+    );
 
     assert_eq!(send_cmd(&mut cr, &mut cw, "STOP_SERVER").await[0], "OK");
     assert!(

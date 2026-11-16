@@ -279,10 +279,13 @@ fun MainScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 modifier = Modifier.weight(1f),
                             )
-                            IconButton(onClick = {
-                                clipboard.setText(AnnotatedString(state.daemon.fingerprintHex))
-                                viewModel.showToast("Copied full SHA-256 fingerprint")
-                            }) {
+                            IconButton(
+                                enabled = state.daemon.fingerprintHex.isNotBlank(),
+                                onClick = {
+                                    clipboard.setText(AnnotatedString(state.daemon.fingerprintHex))
+                                    viewModel.showToast("Copied full SHA-256 fingerprint")
+                                },
+                            ) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = "Copy fingerprint")
                             }
                         }
@@ -300,10 +303,13 @@ fun MainScreen(
                                     contentDescription = "Reveal token",
                                 )
                             }
-                            IconButton(onClick = {
-                                clipboard.setText(AnnotatedString(state.claimToken))
-                                viewModel.showToast("Copied claim token")
-                            }) {
+                            IconButton(
+                                enabled = state.claimToken.isNotBlank(),
+                                onClick = {
+                                    clipboard.setText(AnnotatedString(state.claimToken))
+                                    viewModel.showToast("Copied claim token")
+                                },
+                            ) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = "Copy token")
                             }
                         }
@@ -365,6 +371,7 @@ fun MainScreen(
                         onIgnore = {
                             viewModel.addIgnoredDevice("${dev.vidHex.uppercase()}/${dev.pidHex.uppercase()}")
                         },
+                        onRelease = { viewModel.releaseDevice(dev.busId) },
                     )
                 }
             }
@@ -379,6 +386,7 @@ fun MainScreen(
             onDismiss = { activeDialog = ActiveDialog.NONE },
         )
         ActiveDialog.RELAY -> RelaySettingsDialog(
+            relayEnabled = state.relayEnabled,
             relayStatus = state.daemon.relayStatus,
             relayAddress = state.daemon.relayAddress,
             currentEndpoint = state.relayEndpointDraft,
@@ -403,7 +411,9 @@ fun MainScreen(
             fingerprintHex = state.daemon.fingerprintHex,
             claimToken = state.claimToken,
             plaintextLan = state.daemon.plaintextLan,
+            usbSpeed = state.daemon.speed,
             onTogglePlaintextLan = { viewModel.setPlaintextLan(it) },
+            onSelectSpeed = { viewModel.setUsbSpeed(it) },
             onRegenToken = { viewModel.regenToken() },
             onRotateIdentity = { viewModel.rotateIdentity() },
             onToast = { viewModel.showToast(it) },
@@ -428,6 +438,7 @@ private fun DeviceRow(
     device: DeviceItem,
     onGrantPermission: () -> Unit,
     onIgnore: () -> Unit,
+    onRelease: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -437,17 +448,24 @@ private fun DeviceRow(
             Column(modifier = Modifier.weight(1f)) {
                 Text(device.product, fontWeight = FontWeight.Medium)
                 Text(
-                    "${device.vidHex}/${device.pidHex} · bus ${device.busId} · ${device.state}",
+                    if (device.state == "in_use" && device.peer != "-") {
+                        "${device.vidHex}/${device.pidHex} · bus ${device.busId} · in use by ${device.peer}"
+                    } else {
+                        "${device.vidHex}/${device.pidHex} · bus ${device.busId} · ${device.state}"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                 )
             }
-            if (device.state == "pending_perm") {
-                FilledTonalButton(onClick = onGrantPermission) {
+            when (device.state) {
+                "pending_perm" -> FilledTonalButton(onClick = onGrantPermission) {
                     Text("Grant USB")
                 }
-            } else if (device.state != "ignored") {
-                OutlinedButton(onClick = onIgnore) {
+                "in_use" -> OutlinedButton(onClick = onRelease) {
+                    Text("Release")
+                }
+                "ignored" -> {}
+                else -> OutlinedButton(onClick = onIgnore) {
                     Text("Ignore")
                 }
             }

@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 fun RelaySettingsDialog(
+    relayEnabled: Boolean,
     relayStatus: String,
     relayAddress: String,
     currentEndpoint: String,
@@ -34,8 +35,8 @@ fun RelaySettingsDialog(
     onToast: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var enabled by remember(relayStatus) { mutableStateOf(relayStatus != "disabled") }
-    var endpoint by remember(currentEndpoint) { mutableStateOf(currentEndpoint) }
+    var enabled by remember { mutableStateOf(relayEnabled) }
+    var endpoint by remember { mutableStateOf(currentEndpoint) }
     val clipboard = LocalClipboardManager.current
 
     AlertDialog(

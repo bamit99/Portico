@@ -14,17 +14,21 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import io.portico.app.MainActivity
+import io.portico.app.R
 import io.portico.app.control.ControlChannelClient
 import io.portico.app.control.ControlChannelParser
 import io.portico.app.control.ControlReply
 import io.portico.app.nativebridge.PorticoNative
 import io.portico.app.usb.UsbDeviceManagerBridge
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.File
+import java.util.concurrent.Executors
 
 class PorticoService : Service() {
     inner class LocalBinder : Binder() {
@@ -32,12 +36,18 @@ class PorticoService : Service() {
     }
 
     private val binder = LocalBinder()
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val daemonExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "portico-daemon-jni").apply { isDaemon = true }
+    }
+    private val daemonDispatcher = daemonExecutor.asCoroutineDispatcher()
+    private val serviceScope = CoroutineScope(SupervisorJob() + daemonDispatcher)
 
     private var usbBridge: UsbDeviceManagerBridge? = null
+    private var eventSubJob: Job? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile
     private var daemonStarted = false
 
     val ctrlSocketPath: String by lazy {
@@ -54,31 +64,28 @@ class PorticoService : Service() {
         super.onCreate()
         ensureNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("Starting Portico USB server…"))
-        ensureDaemonStarted()
+        serviceScope.launch {
+            ensureDaemonStartedBlocking()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ensureNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("Portico USB server running"))
-        ensureDaemonStarted()
+        startForeground(NOTIF_ID, buildNotification("Portico USB server active"))
 
-        when (intent?.action) {
-            ACTION_START_AND_SHARE -> {
-                serviceScope.launch {
+        val action = intent?.action
+        serviceScope.launch {
+            ensureDaemonStartedBlocking()
+            when (action) {
+                ACTION_START_AND_SHARE -> {
                     controlClient.sendCommand("START_SERVER")
                     syncLocksFromDaemon()
-                    updateNotification("Sharing USB devices over network")
                 }
-            }
-            ACTION_STOP_SERVER -> {
-                serviceScope.launch {
+                ACTION_STOP_SERVER -> {
                     controlClient.sendCommand("STOP_SERVER")
-                    releaseAllLocks()
-                    updateNotification("USB sharing paused")
+                    syncLocksFromDaemon()
                 }
-            }
-            ACTION_SHUTDOWN_EXIT -> {
-                serviceScope.launch {
+                ACTION_SHUTDOWN_EXIT -> {
                     runCatching { controlClient.sendCommand("SHUTDOWN") }
                     stopSelf()
                 }
@@ -88,14 +95,20 @@ class PorticoService : Service() {
     }
 
     override fun onDestroy() {
+        eventSubJob?.cancel()
+        usbBridge?.unregisterReceiverOnly()
         releaseAllLocks()
-        usbBridge?.stop()
-        usbBridge = null
-        if (daemonStarted) {
-            PorticoNative.nativeStopDaemon()
-            daemonStarted = false
+        // Stop daemon & wait for all active USB/IP tunnels BEFORE closing Android USB fds!
+        runBlocking(daemonDispatcher) {
+            if (daemonStarted) {
+                PorticoNative.nativeStopDaemon()
+                daemonStarted = false
+            }
+            usbBridge?.closeConnectionsBlocking()
+            usbBridge = null
         }
         serviceScope.cancel()
+        daemonExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -104,7 +117,7 @@ class PorticoService : Service() {
     }
 
     fun rescanUsb() {
-        usbBridge?.scanAttachedDevices()
+        usbBridge?.rescanAsync()
     }
 
     fun applyLocks(netLock: Boolean, wakeLockEnabled: Boolean, serverRunning: Boolean) {
@@ -150,16 +163,26 @@ class PorticoService : Service() {
         }
     }
 
-    private fun ensureDaemonStarted() {
-        if (!daemonStarted) {
-            val ok = PorticoNative.nativeStartDaemon(filesDir.absolutePath, ctrlSocketPath)
-            daemonStarted = ok
-            if (ok) {
-                usbBridge = UsbDeviceManagerBridge(this) {}.also { it.start() }
-                serviceScope.launch {
-                    controlClient.sendCommand("REGISTER_CLIENT android-service")
-                    controlClient.sendCommand("START_SERVER")
-                    syncLocksFromDaemon()
+    private suspend fun ensureDaemonStartedBlocking() {
+        if (daemonStarted) return
+        val ok = PorticoNative.nativeStartDaemon(filesDir.absolutePath, ctrlSocketPath)
+        daemonStarted = ok
+        if (ok) {
+            val bridge = UsbDeviceManagerBridge(this, serviceScope, daemonDispatcher) {}
+            usbBridge = bridge
+            bridge.start()
+            controlClient.sendCommand("REGISTER_CLIENT android-service")
+            startHeadlessEventObserver()
+            syncLocksFromDaemon()
+        }
+    }
+
+    private fun startHeadlessEventObserver() {
+        eventSubJob?.cancel()
+        eventSubJob = serviceScope.launch {
+            controlClient.subscribeEvents().collect { ev ->
+                when (ev.type) {
+                    "RECONNECTED", "LOCK_CHANGED", "SERVER_STATE" -> syncLocksFromDaemon()
                 }
             }
         }
@@ -171,6 +194,13 @@ class PorticoService : Service() {
             val st = ControlChannelParser.parseState(reply.line)
             BootPolicy.setStartOnBoot(this, st.startOnBoot)
             applyLocks(st.netLock, st.wakeLock, st.running)
+            updateNotification(
+                if (st.running) {
+                    "Sharing USB devices on port ${st.port}"
+                } else {
+                    "USB sharing paused"
+                },
+            )
         }
     }
 
@@ -205,7 +235,7 @@ class PorticoService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_portico_usb)
             .setContentTitle("Portico")
             .setContentText(text)
             .setOngoing(true)

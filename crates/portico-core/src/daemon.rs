@@ -382,6 +382,13 @@ impl DaemonHandle {
                 Ok(_) => "OK".into(),
                 Err(e) => format!("ERR not_found {}", pct_encode(&e.to_string())),
             },
+            "RELEASE_DEVICE" => {
+                let ignored = self.state.config.lock().await.config.ignored_devices.clone();
+                match self.state.registry.cancel_claim(rest, &ignored).await {
+                    Ok(()) => "OK".into(),
+                    Err(e) => format!("ERR not_found {}", pct_encode(&e.to_string())),
+                }
+            }
             "GET_TOKEN" => {
                 let tok = self.state.config.lock().await.config.claim_token.clone();
                 format!("OK {tok}")

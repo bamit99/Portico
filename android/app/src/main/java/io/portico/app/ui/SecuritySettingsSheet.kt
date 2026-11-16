@@ -2,11 +2,16 @@ package io.portico.app.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
@@ -24,12 +29,15 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SecuritySettingsDialog(
     fingerprintHex: String,
     claimToken: String,
     plaintextLan: Boolean,
+    usbSpeed: String,
     onTogglePlaintextLan: (Boolean) -> Unit,
+    onSelectSpeed: (String) -> Unit,
     onRegenToken: () -> Unit,
     onRotateIdentity: () -> Unit,
     onToast: (String) -> Unit,
@@ -40,9 +48,13 @@ fun SecuritySettingsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("TLS & Security") },
+        title = { Text("TLS, Security & USB") },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+            ) {
                 Text(
                     "TLS 1.3 with offline TOFU fingerprint pinning is always active for remote and relay routes.",
                     style = MaterialTheme.typography.bodySmall,
@@ -57,6 +69,7 @@ fun SecuritySettingsDialog(
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
+                        enabled = fingerprintHex.isNotBlank(),
                         onClick = {
                             clipboard.setText(AnnotatedString(fingerprintHex))
                             onToast("Copied server fingerprint")
@@ -64,10 +77,7 @@ fun SecuritySettingsDialog(
                         modifier = Modifier.weight(1f),
                     ) { Text("Copy FP") }
                     OutlinedButton(
-                        onClick = {
-                            onRotateIdentity()
-                            onToast("Rotated server identity")
-                        },
+                        onClick = onRotateIdentity,
                         modifier = Modifier.weight(1f),
                     ) { Text("Rotate Key") }
                 }
@@ -82,6 +92,7 @@ fun SecuritySettingsDialog(
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
+                        enabled = claimToken.isNotBlank(),
                         onClick = {
                             clipboard.setText(AnnotatedString(claimToken))
                             onToast("Copied claim token")
@@ -89,15 +100,24 @@ fun SecuritySettingsDialog(
                         modifier = Modifier.weight(1f),
                     ) { Text("Copy Token") }
                     OutlinedButton(
-                        onClick = {
-                            onRegenToken()
-                            onToast("Regenerated claim token")
-                        },
+                        onClick = onRegenToken,
                         modifier = Modifier.weight(1f),
                     ) { Text("Regenerate") }
                 }
 
-                Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.height(12.dp))
+                Text("USB Speed Setting", style = MaterialTheme.typography.labelMedium)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("auto", "low", "full", "high", "super").forEach { sp ->
+                        FilterChip(
+                            selected = usbSpeed == sp,
+                            onClick = { onSelectSpeed(sp) },
+                            label = { Text(sp) },
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth(),
