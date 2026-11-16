@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod discover;
 pub mod transport;
 
