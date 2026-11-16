@@ -7,14 +7,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,63 +37,57 @@ fun SystemLogDialog(
         if (filter == "ALL") logs else logs.filter { it.level == filter }
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("System Log") },
-        text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf("ALL", "INFO", "WARN", "ERROR").forEach { lvl ->
-                        FilterChip(
-                            selected = filter == lvl,
-                            onClick = { filter = lvl },
-                            label = { Text(lvl) },
-                        )
+    PorticoSheet(
+        title = "System Log",
+        onDismiss = onDismiss,
+        buttons = {
+            OutlinedButton(
+                onClick = {
+                    val text = filtered.joinToString("\n") {
+                        "${it.seq} [${it.level}] ${it.target}: ${it.message}"
                     }
-                }
-                Spacer(Modifier.height(6.dp))
-                if (filtered.isEmpty()) {
+                    clipboard.setText(AnnotatedString(text))
+                    onToast("Copied ${filtered.size} log lines")
+                },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Copy All")
+            }
+            OutlinedButton(
+                onClick = onClear,
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Clear")
+            }
+            SheetPillButton("Close", onClick = onDismiss, modifier = Modifier.weight(1f))
+        },
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("ALL", "INFO", "WARN", "ERROR").forEach { lvl ->
+                FilterChip(
+                    selected = filter == lvl,
+                    onClick = { filter = lvl },
+                    label = { Text(lvl) },
+                )
+            }
+        }
+        if (filtered.isEmpty()) {
+            Text(
+                "No log messages.",
+                modifier = Modifier.padding(vertical = 16.dp),
+            )
+        } else {
+            SheetListRegion(maxHeight = 260) {
+                items(filtered.asReversed(), key = { it.seq }) { item ->
                     Text(
-                        "No log messages.",
-                        modifier = Modifier.padding(vertical = 16.dp),
+                        "[${item.level}] ${item.target}: ${item.message}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.padding(vertical = 3.dp),
                     )
-                } else {
-                    LazyColumn(modifier = Modifier.height(260.dp)) {
-                        items(filtered.asReversed()) { item ->
-                            Text(
-                                "[${item.level}] ${item.target}: ${item.message}",
-                                style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace,
-                                modifier = Modifier.padding(vertical = 3.dp),
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            val text = filtered.joinToString("\n") {
-                                "${it.seq} [${it.level}] ${it.target}: ${it.message}"
-                            }
-                            clipboard.setText(AnnotatedString(text))
-                            onToast("Copied ${filtered.size} log lines")
-                        },
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text("Copy")
-                    }
-                    OutlinedButton(
-                        onClick = onClear,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text("Clear")
-                    }
                 }
             }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Close") }
-        },
-    )
+        }
+        Spacer(Modifier.height(12.dp))
+    }
 }
