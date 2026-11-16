@@ -1,7 +1,13 @@
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const CTRL_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'%')
+    .add(b'=')
+    .add(b'\t');
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -171,5 +177,5 @@ impl DaemonEvent {
 }
 
 pub fn pct_encode(s: &str) -> String {
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+    utf8_percent_encode(s, CTRL_ENCODE_SET).to_string()
 }
