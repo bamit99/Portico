@@ -31,3 +31,6 @@ usbip = "0.9.0"
 rusb = { version = "0.9.4", features = ["vendored"] }
 clap = { version = "4.5", features = ["derive"] }
 jni = "0.21"
+
+[patch.crates-io]
+usbip = { path = "vendor/usbip" }
