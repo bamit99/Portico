@@ -18,6 +18,8 @@ percent-encoding.workspace = true
 tracing.workspace = true
 rand.workspace = true
 hex.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+portico-relay = { path = "../portico-relay" }

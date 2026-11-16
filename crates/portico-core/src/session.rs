@@ -203,18 +203,6 @@ where
                         let res = usbip::handler(&mut stream, state.registry.usbip_server()).await;
                         let ignored = state.config.lock().await.config.ignored_devices.clone();
                         state.registry.mark_released(&bus_id, &ignored).await;
-                        let new_state = if ignored
-                            .iter()
-                            .any(|vp| {
-                                // Best-effort state lookup
-                                let _ = vp;
-                                false
-                            }) {
-                            "ignored"
-                        } else {
-                            "shared"
-                        };
-                        let _ = new_state;
                         let final_state = state
                             .registry
                             .list_devices()
