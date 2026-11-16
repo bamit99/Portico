@@ -1,0 +1,15 @@
+[package]
+name = "portico-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+portico-proto = { path = "../portico-proto" }
+tokio.workspace = true
+tracing.workspace = true
+subtle.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio-rustls.workspace = true

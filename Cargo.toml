@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/portico-proto",
+    "crates/portico-relay",
 ]
 
 [workspace.package]
