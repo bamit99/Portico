@@ -2,7 +2,6 @@ package io.portico.app.ui
 
 import android.content.Intent
 import android.net.Uri
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -37,7 +36,7 @@ fun DesktopClientSetupDialog(
         },
     ) {
         Text("Run on your desktop Linux workstation:", style = MaterialTheme.typography.bodySmall)
-        MonoValuePill(
+        CodeBlock(
             text = cmd,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -49,7 +48,6 @@ fun DesktopClientSetupDialog(
             },
             modifier = Modifier.fillMaxWidth(),
         )
-        Spacer(Modifier.weight(1f))
     }
 }
 
@@ -83,7 +81,6 @@ fun HelpDialog(onDismiss: () -> Unit) {
             },
             modifier = Modifier.fillMaxWidth(),
         )
-        Spacer(Modifier.weight(1f))
     }
 }
 
@@ -107,6 +104,5 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 "Project: https://github.com/bamit99/Portico",
             style = MaterialTheme.typography.bodySmall,
         )
-        Spacer(Modifier.weight(1f))
     }
 }
