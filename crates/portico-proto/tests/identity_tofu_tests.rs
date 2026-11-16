@@ -64,6 +64,15 @@ fn known_hosts_tofu_lifecycle_and_atomic_save() {
         reloaded.check("192.168.1.50:37420", &fp1),
         TofuDecision::Trusted
     );
+    // Manual uppercase/colon entry in known_hosts still matches
+    let mut manual = KnownHosts::default();
+    manual
+        .entries
+        .insert("192.168.1.51:37420".into(), "A".repeat(64));
+    assert_eq!(
+        manual.check("192.168.1.51:37420", &"a".repeat(64)),
+        TofuDecision::Trusted
+    );
     assert_eq!(
         reloaded.check("192.168.1.50:37420", &fp2),
         TofuDecision::Mismatch {

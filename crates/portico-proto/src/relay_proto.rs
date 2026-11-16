@@ -149,7 +149,13 @@ pub fn parse_relay_uri(uri: &str) -> Result<(String, [u8; 16]), ProtoError> {
     let (host_port, id_hex) = rest
         .split_once('/')
         .ok_or_else(|| ProtoError::InvalidRelayUri(uri.to_string()))?;
-    if host_port.is_empty() || !host_port.contains(':') || id_hex.len() != 32 {
+    let Some((host, port_str)) = host_port.rsplit_once(':') else {
+        return Err(ProtoError::InvalidRelayUri(uri.to_string()));
+    };
+    if host.is_empty()
+        || port_str.parse::<u16>().map(|p| p == 0).unwrap_or(true)
+        || id_hex.len() != 32
+    {
         return Err(ProtoError::InvalidRelayUri(uri.to_string()));
     }
     let decoded = hex::decode(id_hex)

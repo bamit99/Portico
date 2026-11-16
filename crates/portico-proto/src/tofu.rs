@@ -36,11 +36,15 @@ impl KnownHosts {
     pub fn check(&self, endpoint: &str, actual_fp_hex: &str) -> TofuDecision {
         let actual = normalize_fingerprint(actual_fp_hex).unwrap_or_else(|_| actual_fp_hex.to_lowercase());
         match self.entries.get(endpoint) {
-            Some(expected) if expected == &actual => TofuDecision::Trusted,
-            Some(expected) => TofuDecision::Mismatch {
-                expected: expected.clone(),
-                actual,
-            },
+            Some(raw_expected) => {
+                let expected = normalize_fingerprint(raw_expected)
+                    .unwrap_or_else(|_| raw_expected.to_lowercase());
+                if expected == actual {
+                    TofuDecision::Trusted
+                } else {
+                    TofuDecision::Mismatch { expected, actual }
+                }
+            }
             None => TofuDecision::FirstUse(actual),
         }
     }

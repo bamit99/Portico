@@ -37,6 +37,14 @@ async fn relay_frames_and_uri_roundtrip() {
         parse_relay_uri("prly://127.0.0.1:37422/badhex"),
         Err(ProtoError::InvalidRelayUri(_))
     ));
+    assert!(matches!(
+        parse_relay_uri("prly://:37422/12121212121212121212121212121212"),
+        Err(ProtoError::InvalidRelayUri(_))
+    ));
+    assert!(matches!(
+        parse_relay_uri("prly://host:notaport/12121212121212121212121212121212"),
+        Err(ProtoError::InvalidRelayUri(_))
+    ));
 
     let frames = vec![
         RelayFrame::ControlRegister {
