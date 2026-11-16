@@ -1,3 +1,4 @@
+pub mod frame;
 pub mod token;
 
 use thiserror::Error;
