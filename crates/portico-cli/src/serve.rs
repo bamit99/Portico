@@ -58,6 +58,11 @@ pub async fn start_host_daemon(opts: ServeOptions) -> Result<PorticoDaemon, CliE
         if let Ok(ctx) = rusb::Context::new() {
             if let Ok(list) = ctx.devices() {
                 for dev in list.iter() {
+                    if let Ok(desc) = dev.device_descriptor() {
+                        if desc.class_code() == 0x09 {
+                            continue; // skip USB hubs
+                        }
+                    }
                     let Ok(handle) = dev.open() else {
                         continue;
                     };

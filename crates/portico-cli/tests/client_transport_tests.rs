@@ -165,6 +165,24 @@ async fn tofu_pin_mismatch_public_plaintext_rejection_and_relay_list() {
     assert_eq!(relay_list.len(), 1);
     assert_eq!(relay_list[0].bus_id, "1-1");
 
+    // Malformed prly:// URIs and unbracketed IPv6 target parsing
+    assert!(TargetEndpoint::parse("prly://127.0.0.1:37422/badhex").is_err());
+    assert!(TargetEndpoint::parse("prly://127.0.0.1:37422/").is_err());
+    assert_eq!(
+        TargetEndpoint::parse("::1").unwrap(),
+        TargetEndpoint::Direct("[::1]:37420".into())
+    );
+    assert!(cmd_list(ConnectOptions {
+        config_dir: cli_dir.path(),
+        target: "prly://127.0.0.1:37422/not-hex",
+        token: &token,
+        trust_fp: None,
+        insecure_lan_plaintext: false,
+        client_name: "cli",
+    })
+    .await
+    .is_err());
+
     relay_task.abort();
     daemon.shutdown().await;
 }

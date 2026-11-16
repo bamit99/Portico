@@ -148,5 +148,46 @@ async fn reverse_listener_mtls_and_concurrent_two_device_attach_via_serve() {
 
     t1.abort();
     t2.abort();
+
+    // Malformed --allow-server fingerprint rejected eagerly
+    assert!(ReverseListener::bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        rev_id.clone(),
+        vec!["not-a-valid-hex-fp".into()],
+        "tok".into(),
+    )
+    .await
+    .is_err());
+
+    // Untrusted server cert rejected at TLS layer
+    let rogue_srv = portico_proto::identity::NodeIdentity::generate("rogue").unwrap();
+    let (rogue_cfg, _) = portico_proto::tls::build_client_tls_config(
+        Some(&rogue_srv),
+        portico_proto::tls::CertCheckPolicy::PinnedOrFirstUse {
+            expected_fp: Some(rev_id.fingerprint_hex()),
+            trust_first_use: false,
+        },
+    )
+    .unwrap();
+    let rogue_tcp = TcpStream::connect(rev_addr).await.unwrap();
+    let rogue_conn = tokio_rustls::TlsConnector::from(rogue_cfg)
+        .connect("localhost".try_into().unwrap(), rogue_tcp)
+        .await;
+    if let Ok(mut tls) = rogue_conn {
+        let mut b = [0u8; 4];
+        assert!(tls.read(&mut b).await.unwrap_or(0) == 0 || tls.read(&mut b).await.is_err());
+    }
+
+    // Stopping and restarting server allows clean reverse reconnect
+    h.exec_command("STOP_SERVER").await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    h.exec_command("START_SERVER").await;
+    let ctrl_reconnected =
+        tokio::time::timeout(Duration::from_secs(4), listener.wait_for_server_ready())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(ctrl_reconnected.server_fp, server_fp);
+
     daemon.shutdown().await;
 }

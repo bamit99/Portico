@@ -69,13 +69,19 @@ pub async fn run_usbip_attach_command(
         .arg("-b")
         .arg(bus_id)
         .output()
-        .await?;
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to execute '{usbip_bin}': {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::Remote(format!(
-            "usbip attach failed (exit {:?}): {}",
-            output.status.code(),
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
             stderr.trim()
+        };
+        return Err(CliError::Remote(format!(
+            "usbip attach failed (exit {:?}): {detail}",
+            output.status.code(),
         )));
     }
     Ok(())

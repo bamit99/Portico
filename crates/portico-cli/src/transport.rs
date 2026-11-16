@@ -40,7 +40,12 @@ impl TargetEndpoint {
         if trimmed.is_empty() {
             return Err(CliError::Remote("empty target".into()));
         }
-        let with_port = if trimmed.starts_with('[') {
+        let with_port = if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(_) => format!("{ip}:{DEFAULT_PORT}"),
+                IpAddr::V6(_) => format!("[{ip}]:{DEFAULT_PORT}"),
+            }
+        } else if trimmed.starts_with('[') {
             if trimmed.contains("]:") {
                 trimmed.to_string()
             } else {
@@ -148,7 +153,9 @@ pub async fn connect_and_auth(opts: ConnectOptions<'_>) -> Result<AuthenticatedS
         let pinned_fp = if let Some(ref tfp) = explicit_trust {
             Some(tfp.clone())
         } else {
-            kh.entries.get(&pin_key).cloned()
+            kh.entries
+                .get(&pin_key)
+                .map(|raw| normalize_fingerprint(raw).unwrap_or_else(|_| raw.to_lowercase()))
         };
 
         let (tls_cfg, observed) = build_client_tls_config(

@@ -5,7 +5,7 @@ use portico_proto::frame::{
     read_frame, write_frame, AuthKind, DeviceSummary, Frame, HelloStatus, TunnelStatus,
     CAP_USBIP_V1, PROTOCOL_VERSION_V0,
 };
-use portico_proto::identity::{cert_fingerprint_hex, NodeIdentity};
+use portico_proto::identity::{cert_fingerprint_hex, normalize_fingerprint, NodeIdentity};
 use portico_proto::tls::{build_server_tls_config, PinAllowlist};
 use rand::RngCore;
 use std::collections::HashMap;
@@ -31,8 +31,14 @@ enum ControlRequest {
     },
 }
 
+#[derive(Clone)]
+enum ControlSlot {
+    Connecting,
+    Ready(mpsc::Sender<ControlRequest>),
+}
+
 struct ReverseInner {
-    controls: Mutex<HashMap<String, mpsc::Sender<ControlRequest>>>,
+    controls: Mutex<HashMap<String, ControlSlot>>,
     pending_data: Mutex<HashMap<[u8; 16], oneshot::Sender<Result<AuthenticatedStream, CliError>>>>,
     ready_tx: Mutex<Option<mpsc::Sender<ReverseControlHandle>>>,
     ready_rx: Mutex<mpsc::Receiver<ReverseControlHandle>>,
@@ -67,7 +73,17 @@ impl ReverseListener {
         allowed_server_fps: Vec<String>,
         claim_token: String,
     ) -> Result<Self, CliError> {
-        let allowlist = Arc::new(PinAllowlist::new(allowed_server_fps));
+        if allowed_server_fps.is_empty() {
+            return Err(CliError::Remote(
+                "at least one --allow-server SHA-256 fingerprint is required".into(),
+            ));
+        }
+        let normalized_fps = allowed_server_fps
+            .into_iter()
+            .map(|fp| normalize_fingerprint(&fp))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let allowlist = Arc::new(PinAllowlist::new(normalized_fps));
         let tls_cfg = build_server_tls_config(&identity, Some(allowlist))?;
         let acceptor = TlsAcceptor::from(tls_cfg);
         let listener = TcpListener::bind(bind_addr).await?;
@@ -104,11 +120,26 @@ impl ReverseListener {
                         return;
                     };
 
-                    let is_control = !inn.controls.lock().await.contains_key(&peer_fp);
-                    if is_control {
-                        let _ = handle_control_conn(tls, peer_fp, inn).await;
-                    } else {
-                        let _ = handle_data_conn(tls, inn).await;
+                    let slot = {
+                        let mut guard = inn.controls.lock().await;
+                        match guard.get(&peer_fp).cloned() {
+                            None => {
+                                guard.insert(peer_fp.clone(), ControlSlot::Connecting);
+                                None
+                            }
+                            Some(s) => Some(s),
+                        }
+                    };
+                    match slot {
+                        None => {
+                            let _ = handle_control_conn(tls, peer_fp, inn).await;
+                        }
+                        Some(ControlSlot::Ready(_)) => {
+                            let _ = handle_data_conn(tls, inn).await;
+                        }
+                        Some(ControlSlot::Connecting) => {
+                            // Duplicate connection before initial control handshake finished
+                        }
                     }
                 });
             }
@@ -140,15 +171,15 @@ impl ReverseListener {
             .ok_or_else(|| CliError::Remote("reverse listener closed".into()))
     }
 
+    async fn control_sender(&self, server_fp: &str) -> Result<mpsc::Sender<ControlRequest>, CliError> {
+        match self.inner.controls.lock().await.get(server_fp).cloned() {
+            Some(ControlSlot::Ready(tx)) => Ok(tx),
+            _ => Err(CliError::Remote("reverse server not connected".into())),
+        }
+    }
+
     pub async fn list_devices(&self, server_fp: &str) -> Result<Vec<DeviceSummary>, CliError> {
-        let tx = self
-            .inner
-            .controls
-            .lock()
-            .await
-            .get(server_fp)
-            .cloned()
-            .ok_or_else(|| CliError::Remote("reverse server not connected".into()))?;
+        let tx = self.control_sender(server_fp).await?;
         let (rtx, rrx) = oneshot::channel();
         tx.send(ControlRequest::List(rtx))
             .await
@@ -162,14 +193,7 @@ impl ReverseListener {
         server_fp: &str,
         bus_id: &str,
     ) -> Result<(SocketAddr, JoinHandle<Result<(), CliError>>), CliError> {
-        let tx = self
-            .inner
-            .controls
-            .lock()
-            .await
-            .get(server_fp)
-            .cloned()
-            .ok_or_else(|| CliError::Remote("reverse server not connected".into()))?;
+        let tx = self.control_sender(server_fp).await?;
 
         let mut conn_nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut conn_nonce);
@@ -207,6 +231,25 @@ impl ReverseListener {
     }
 }
 
+struct ControlCleanup {
+    peer_fp: String,
+    inner: Arc<ReverseInner>,
+}
+
+impl Drop for ControlCleanup {
+    fn drop(&mut self) {
+        let fp = self.peer_fp.clone();
+        if let Ok(mut g) = self.inner.controls.try_lock() {
+            g.remove(&fp);
+        } else {
+            let inn = self.inner.clone();
+            tokio::spawn(async move {
+                inn.controls.lock().await.remove(&fp);
+            });
+        }
+    }
+}
+
 async fn handle_control_conn<S>(
     mut stream: S,
     peer_fp: String,
@@ -215,6 +258,11 @@ async fn handle_control_conn<S>(
 where
     S: AsyncRw + 'static,
 {
+    let _cleanup = ControlCleanup {
+        peer_fp: peer_fp.clone(),
+        inner: inner.clone(),
+    };
+
     write_frame(
         &mut stream,
         &Frame::ClientHello {
@@ -246,7 +294,11 @@ where
     };
 
     let (tx, mut rx) = mpsc::channel::<ControlRequest>(32);
-    inner.controls.lock().await.insert(peer_fp.clone(), tx);
+    inner
+        .controls
+        .lock()
+        .await
+        .insert(peer_fp.clone(), ControlSlot::Ready(tx));
 
     if let Some(ref ready_tx) = *inner.ready_tx.lock().await {
         let _ = ready_tx
@@ -257,44 +309,62 @@ where
             .await;
     }
 
-    while let Some(req) = rx.recv().await {
-        match req {
-            ControlRequest::List(reply) => {
-                if write_frame(&mut stream, &Frame::ListDevicesReq)
-                    .await
-                    .is_err()
-                {
-                    let _ = reply.send(Err(CliError::Remote("control write failed".into())));
-                    break;
-                }
-                match read_frame(&mut stream).await {
-                    Ok(Frame::ListDevicesResp { devices }) => {
-                        let _ = reply.send(Ok(devices));
+    loop {
+        tokio::select! {
+            maybe_req = rx.recv() => {
+                let Some(req) = maybe_req else { break; };
+                match req {
+                    ControlRequest::List(reply) => {
+                        if write_frame(&mut stream, &Frame::ListDevicesReq)
+                            .await
+                            .is_err()
+                        {
+                            let _ = reply.send(Err(CliError::Remote("control write failed".into())));
+                            break;
+                        }
+                        match read_frame(&mut stream).await {
+                            Ok(Frame::ListDevicesResp { devices }) => {
+                                let _ = reply.send(Ok(devices));
+                            }
+                            Ok(other) => {
+                                let _ = reply.send(Err(CliError::Remote(format!("unexpected: {other:?}"))));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(CliError::Proto(e)));
+                                break;
+                            }
+                        }
                     }
-                    Ok(other) => {
-                        let _ = reply.send(Err(CliError::Remote(format!("unexpected: {other:?}"))));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(CliError::Proto(e)));
-                        break;
+                    ControlRequest::RequestData { conn_nonce, bus_id } => {
+                        if write_frame(
+                            &mut stream,
+                            &Frame::RequestReverseDataConn { conn_nonce, bus_id },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if let Some(dtx) = inner.pending_data.lock().await.remove(&conn_nonce) {
+                                let _ = dtx.send(Err(CliError::Remote("reverse control write failed".into())));
+                            }
+                            break;
+                        }
                     }
                 }
             }
-            ControlRequest::RequestData { conn_nonce, bus_id } => {
-                if write_frame(
-                    &mut stream,
-                    &Frame::RequestReverseDataConn { conn_nonce, bus_id },
-                )
-                .await
-                .is_err()
-                {
-                    break;
+            incoming = read_frame(&mut stream) => {
+                match incoming {
+                    Ok(Frame::Ping { nonce }) => {
+                        if write_frame(&mut stream, &Frame::Pong { nonce }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
                 }
             }
         }
     }
 
-    inner.controls.lock().await.remove(&peer_fp);
     Ok(())
 }
 

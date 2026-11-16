@@ -73,8 +73,8 @@ enum Commands {
         token: String,
         #[arg(long = "allow-server", required = true)]
         allow_servers: Vec<String>,
-        #[arg(long)]
-        attach_bus: Option<String>,
+        #[arg(long = "attach-bus")]
+        attach_buses: Vec<String>,
         #[arg(long)]
         proxy_only: bool,
     },
@@ -110,6 +110,28 @@ fn default_config_dir() -> PathBuf {
         return PathBuf::from(home).join(".config").join("portico");
     }
     PathBuf::from(".portico")
+}
+
+async fn futures_wait_any(
+    tasks: Vec<tokio::task::JoinHandle<Result<(), portico_cli::CliError>>>,
+) -> Result<(), portico_cli::CliError> {
+    let mut set = tokio::task::JoinSet::new();
+    for t in tasks {
+        set.spawn(async move {
+            match t.await {
+                Ok(r) => r,
+                Err(e) => Err(portico_cli::CliError::Remote(format!("bridge task panicked: {e}"))),
+            }
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(portico_cli::CliError::Remote(format!("join error: {e}"))),
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -234,7 +256,7 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
             bind,
             token,
             allow_servers,
-            attach_bus,
+            attach_buses,
             proxy_only,
         } => {
             let id = ReverseListener::load_or_create_identity(cfg_dir)?;
@@ -250,17 +272,30 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
                 println!("  {}\t{:04x}:{:04x}\t{}", d.bus_id, d.vid, d.pid, d.product);
             }
 
-            if let Some(bus_id) = attach_bus {
-                let (local_addr, bridge_task) = listener
-                    .open_reverse_tunnel(&ctrl.server_fp, &bus_id)
-                    .await?;
-                println!("Reverse USB/IP bridge for {bus_id} on {local_addr}");
-                if !proxy_only {
-                    run_usbip_attach_command("usbip", local_addr.port(), &bus_id).await?;
+            if !attach_buses.is_empty() {
+                let mut tasks = Vec::new();
+                for bus_id in attach_buses {
+                    let (local_addr, bridge_task) = listener
+                        .open_reverse_tunnel(&ctrl.server_fp, &bus_id)
+                        .await?;
+                    println!("Reverse USB/IP bridge for {bus_id} on {local_addr}");
+                    if proxy_only {
+                        println!(
+                            "Proxy-only mode: run `usbip --tcp-port {} attach -r 127.0.0.1 -b {bus_id}`",
+                            local_addr.port()
+                        );
+                    } else {
+                        run_usbip_attach_command("usbip", local_addr.port(), &bus_id).await?;
+                    }
+                    tasks.push(bridge_task);
                 }
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
-                    _ = bridge_task => {}
+                    res = futures_wait_any(tasks) => {
+                        if let Err(e) = res {
+                            return Err(e.into());
+                        }
+                    }
                 }
             } else {
                 tokio::signal::ctrl_c().await?;
