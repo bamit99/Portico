@@ -1,3 +1,4 @@
+pub mod discover;
 pub mod transport;
 
 use thiserror::Error;
