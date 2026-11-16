@@ -1,4 +1,5 @@
 pub mod config;
+pub mod logging;
 
 use thiserror::Error;
 
