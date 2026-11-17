@@ -6,6 +6,8 @@
 
 ## Using the desktop CLI (Linux)
 
+**Platform support:** the desktop CLI is Linux-only today. The device-attach path depends on the `vhci-hcd` kernel module and the `usbip` CLI, which macOS does not have; `session.rs` also reads `/proc/self/mountinfo`. The platform-independent parts (protocol, TLS/TOFU, `pair`, `discover`, `list`, `trust`, `relay`, `identity`) would build and run on macOS, but `attach`/`detach`/`status`/`stop` need a clean-room DriverKit client — the same signing/notarization hurdle noted for Windows — and are out of v1 scope. Android (phone/server side) is unaffected.
+
 Install the binary to a PATH directory (e.g. `~/bin/portico`). All commands work from anywhere.
 
 **One-time setup — passwordless sudo for USB/IP.** `usbip attach`/`detach` write to `/sys/devices/platform/vhci_hcd.*/`, which needs root. In non-background mode the CLI asks sudo on demand; for background mode a NOPASSWD rule is required (a detached process has no terminal to prompt). Install it once:
