@@ -57,22 +57,77 @@ pub async fn bridge_already_open_tunnel(
     Ok((local_addr, handle))
 }
 
+/// Returns true when running as root (uid 0).
+fn is_root() -> bool {
+    // SAFETY: geteuid() takes no arguments and always succeeds.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Build the usbip attach invocation. When not root, wrap in `sudo` so the
+/// kernel import step can write /sys/devices/platform/vhci_hcd.*/attach.
+/// Only `usbip` runs elevated: the TLS handshake, TOFU pin and claim token
+/// were already handled by the parent CLI as the regular user, and the
+/// loopback bridge stays in this process — sudo never needs the config store.
+pub fn usbip_attach_invocation(
+    usbip_bin: &str,
+    local_port: u16,
+    bus_id: &str,
+    is_root: bool,
+) -> (String, Vec<String>) {
+    let usbip_args: Vec<String> = [
+        "--tcp-port".to_string(),
+        local_port.to_string(),
+        "attach".to_string(),
+        "-r".to_string(),
+        "127.0.0.1".to_string(),
+        "-b".to_string(),
+        bus_id.to_string(),
+    ]
+    .to_vec();
+    if is_root {
+        (usbip_bin.to_string(), usbip_args)
+    } else {
+        let mut args = vec!["--".to_string(), usbip_bin.to_string()];
+        args.extend(usbip_args);
+        ("sudo".to_string(), args)
+    }
+}
+
 pub async fn run_usbip_attach_command(
     usbip_bin: &str,
     local_port: u16,
     bus_id: &str,
 ) -> Result<(), CliError> {
-    let output = Command::new(usbip_bin)
-        .arg("--tcp-port")
-        .arg(local_port.to_string())
-        .arg("attach")
-        .arg("-r")
-        .arg("127.0.0.1")
-        .arg("-b")
-        .arg(bus_id)
+    let root = is_root();
+    if !root {
+        eprintln!(
+            "usbip attach needs root to import the vhci device; requesting sudo (password prompt may appear)"
+        );
+    }
+    let (prog, args) = usbip_attach_invocation(usbip_bin, local_port, bus_id, root);
+    let mut cmd = Command::new(&prog);
+    cmd.args(&args);
+    if !root {
+        // Let sudo prompt on the real terminal: inherit stdio instead of capturing it.
+        cmd.stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        let status = cmd
+            .status()
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to execute '{prog}': {e}")))?;
+        if !status.success() {
+            return Err(CliError::Remote(format!(
+                "usbip attach failed via sudo (exit {:?}) — sudo authentication or the vhci import was refused",
+                status.code(),
+            )));
+        }
+        return Ok(());
+    }
+    let output = cmd
         .output()
         .await
-        .map_err(|e| CliError::Remote(format!("failed to execute '{usbip_bin}': {e}")))?;
+        .map_err(|e| CliError::Remote(format!("failed to execute '{prog}': {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);

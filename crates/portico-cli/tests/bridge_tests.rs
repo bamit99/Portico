@@ -1,4 +1,4 @@
-use portico_cli::bridge::{run_usbip_attach_command, start_local_usbip_bridge};
+use portico_cli::bridge::{run_usbip_attach_command, start_local_usbip_bridge, usbip_attach_invocation};
 use portico_cli::transport::{connect_and_auth, ConnectOptions};
 use portico_core::daemon::PorticoDaemon;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -140,6 +140,43 @@ async fn bridge_tunnels_usbip_over_tls_and_fails_on_missing_bus_or_failing_usbip
         .is_err());
 
     daemon.shutdown().await;
+}
+
+#[test]
+fn usbip_attach_invocation_wraps_with_sudo_when_not_root() {
+    // non-root: must invoke sudo with separator, preserving the usbip args
+    let (prog, args) = usbip_attach_invocation("usbip", 37781, "1-2", false);
+    assert_eq!(prog, "sudo");
+    assert_eq!(
+        args,
+        vec![
+            "--",
+            "usbip",
+            "--tcp-port",
+            "37781",
+            "attach",
+            "-r",
+            "127.0.0.1",
+            "-b",
+            "1-2"
+        ]
+    );
+
+    // root: invoke usbip directly, no sudo wrapper
+    let (prog, args) = usbip_attach_invocation("usbip", 37781, "1-2", true);
+    assert_eq!(prog, "usbip");
+    assert_eq!(
+        args,
+        vec![
+            "--tcp-port",
+            "37781",
+            "attach",
+            "-r",
+            "127.0.0.1",
+            "-b",
+            "1-2"
+        ]
+    );
 }
 
 #[tokio::test]
