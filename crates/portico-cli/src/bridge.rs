@@ -93,6 +93,29 @@ pub fn usbip_attach_invocation(
     }
 }
 
+/// Detach a vhci port. Needs root for the sysfs write; wraps with sudo when
+/// not root (same NOPASSWD rule as attach).
+pub async fn run_usbip_detach(port: u8) -> Result<(), CliError> {
+    let root = is_root();
+    let mut args = vec!["detach".to_string(), "-p".to_string(), port.to_string()];
+    let prog = if root {
+        "usbip".to_string()
+    } else {
+        eprintln!("usbip detach needs root; requesting sudo");
+        args = [vec!["--".to_string(), "usbip".to_string()], args].concat();
+        "sudo".to_string()
+    };
+    let status = Command::new(&prog)
+        .args(&args)
+        .status()
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to execute '{prog}': {e}")))?;
+    if !status.success() {
+        return Err(CliError::Remote(format!("usbip detach failed (exit {:?})", status.code())));
+    }
+    Ok(())
+}
+
 pub async fn run_usbip_attach_command(
     usbip_bin: &str,
     local_port: u16,

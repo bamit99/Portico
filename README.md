@@ -4,6 +4,52 @@
 
 ---
 
+## Using the desktop CLI (Linux)
+
+Install the binary to a PATH directory (e.g. `~/bin/portico`). All commands work from anywhere.
+
+**One-time setup — passwordless sudo for USB/IP.** `usbip attach`/`detach` write to `/sys/devices/platform/vhci_hcd.*/`, which needs root. In non-background mode the CLI asks sudo on demand; for background mode a NOPASSWD rule is required (a detached process has no terminal to prompt). Install it once:
+
+```
+sudo visudo -f /etc/sudoers.d/portico
+```
+
+Add this line (replace `amit` with your username), save, then verify with `sudo -l -U amit`:
+
+```
+amit ALL=(root) NOPASSWD: /usr/bin/usbip *
+```
+
+Also load the kernel module once per boot:
+
+```
+sudo modprobe vhci-hcd
+echo vhci_hcd | sudo tee /etc/modules-load.d/portico.conf   # persist across reboots
+```
+
+**Normal flow.** The phone's UDP discovery broadcast is blocked on many Wi-Fi APs; target the phone IP directly. TCP port 37420 is the service, UDP 37421 is discovery (discovery just reports the TCP port):
+
+```
+portico discover --target 192.168.0.181:37421     # optional — find the TCP port
+portico pair 192.168.0.181                          # TOFU: compare badge, answer y; pins cert + stores token
+portico list 192.168.0.181:37420                   # first column = bus ID (no --token needed after pair)
+```
+
+Copy the **bus ID** (first column of `portico list`) into `attach` — do not guess it from the Android UI. It is a phone-side kernel port address (`1-2`, `2-1`, …) that changes when the disk is replugged or the phone reboots. `list` always shows what is currently shared; `in_use` means another client holds it.
+
+```
+portico attach 192.168.0.181:37420 1-2                       # foreground; Ctrl-C to disconnect
+portico attach 192.168.0.181:37420 1-2 --background           # detached; prompt returns immediately
+portico status                                                # list active background attachments
+portico stop 1-2                                              # stop one; frees its vhci port
+```
+
+After a successful attach the kernel enumerates the disk and `udisksd` auto-mounts it under `/run/media/<user>/<label>`; the CLI prints the mount path (or a fallback `lsblk`/`udisksctl` hint if nothing auto-mounts), and `portico status` shows it in the `mounts=` column for background sessions. Fingerprints are case-insensitive dash-stripped hex (64 chars) — paste the phone badge into `portico trust`; claim tokens are uppercase Crockford base32, case-sensitive — copy-paste, never retype.
+
+**Pin/token store:** `~/.config/portico/known_hosts.json` (TOFU pins) and `tokens.json` (per-endpoint claim tokens). Background session records live in `$XDG_RUNTIME_DIR/portico/` (tmpfs — cleared on reboot); detach cleans them up.
+
+---
+
 ## The prompt to execute
 
 > Use the `brainstorming` skill first — this is new creative design work. Then follow §Process below; use the `writing-plans`, `subagent-driven-development` (or `executing-plans`), `test-driven-development`, `requesting-code-review`/`receiving-code-review`, and `verification-before-completion` skills at the marked points.

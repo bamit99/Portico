@@ -1,8 +1,12 @@
 use clap::{Parser, Subcommand};
-use portico_cli::bridge::{run_usbip_attach_command, start_local_usbip_bridge};
+use portico_cli::bridge::{run_usbip_attach_command, run_usbip_detach, start_local_usbip_bridge};
 use portico_cli::discover::discover_servers;
 use portico_cli::reverse::ReverseListener;
 use portico_cli::serve::{start_host_daemon, ServeOptions};
+use portico_cli::session::{
+    find_active, load_attachments, log_path, new_mounts, parse_vhci_port, pid_alive,
+    remove_attachment, save_attachment, snapshot_mounts, Attachment,
+};
 use portico_cli::transport::{cmd_list, cmd_pair, cmd_trust, connect_and_auth, resolve_token, ConnectOptions};
 use portico_proto::identity::format_short_fingerprint;
 use portico_proto::{DEFAULT_DISCOVERY_PORT, DEFAULT_PORT};
@@ -67,7 +71,15 @@ enum Commands {
         insecure_lan_plaintext: bool,
         #[arg(long, help = "Start local USB/IP bridge without invoking `usbip attach`")]
         proxy_only: bool,
+        #[arg(short = 'b', long, help = "Detach from the terminal and keep the device attached in the background")]
+        background: bool,
+        #[arg(long, hide = true, help = "Internal: this process is the background daemon")]
+        daemon_child: bool,
     },
+    /// Show active background attachments
+    Status,
+    /// Stop a background attachment and free its vhci port
+    Stop { bus_id: String },
     /// Detach a virtual USB/IP port via `usbip detach`
     Detach {
         #[arg(long)]
@@ -140,6 +152,60 @@ async fn futures_wait_any(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_background_attach(log: &std::path::Path, args: &[String]) -> Result<u32, Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+    let err = out.try_clone()?;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err));
+    // New session: no controlling terminal, survives the shell that launched it.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    Ok(cmd.spawn()?.id())
+}
+
+/// Print newly mounted removable media for ~10s after attach, then a hint.
+/// When a background session is supplied, also record the mount points so
+/// `portico status` can show them.
+fn spawn_mount_watcher(
+    before: std::collections::HashSet<String>,
+    session: Option<(std::path::PathBuf, String)>,
+) {
+    tokio::spawn(async move {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let added = new_mounts(&before, &snapshot_mounts());
+            if !added.is_empty() {
+                for mount in &added {
+                    println!("USB disk mounted at: {mount}");
+                }
+                if let Some((cfg, bus_id)) = session {
+                    if let Some(mut att) = find_active(&cfg, &bus_id) {
+                        att.mount_points = added;
+                        let _ = save_attachment(&cfg, &att);
+                    }
+                }
+                return;
+            }
+        }
+        println!("No auto-mount detected. Find the disk with `lsblk`, then mount it, e.g. `udisksctl mount -b /dev/sdX1`.");
+    });
 }
 
 #[tokio::main]
@@ -227,7 +293,41 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
             trust,
             insecure_lan_plaintext,
             proxy_only,
+            background,
+            daemon_child,
         } => {
+            if !daemon_child {
+                if let Some(active) = find_active(cfg_dir, &bus_id) {
+                    return Err(format!(
+                        "already attached: {bus_id} from {} (pid {}, vhci port {:?}). Use `portico status` / `portico stop {bus_id}`.",
+                        active.target, active.pid, active.vhci_port
+                    ).into());
+                }
+                if background {
+                    let log = log_path(cfg_dir, &bus_id);
+                    let mut child_args: Vec<String> = vec![
+                        "--config-dir".into(), cfg_dir.display().to_string(),
+                        "attach".into(), target.clone(), bus_id.clone(),
+                    ];
+                    if let Some(t) = &token {
+                        child_args.extend(["--token".into(), t.clone()]);
+                    }
+                    if let Some(f) = &trust {
+                        child_args.extend(["--trust".into(), f.clone()]);
+                    }
+                    if insecure_lan_plaintext { child_args.push("--insecure-lan-plaintext".into()); }
+                    if proxy_only { child_args.push("--proxy-only".into()); }
+                    child_args.push("--daemon-child".into());
+                    #[cfg(unix)]
+                    let pid = spawn_background_attach(&log, &child_args)?;
+                    #[cfg(not(unix))]
+                    return Err("background mode is Linux-only".into());
+                    println!("Attached {bus_id} in background (pid {pid}). Log: {}", log.display());
+                    return Ok(());
+                }
+            }
+
+            let before_mounts = snapshot_mounts();
             let token = resolve_token(cfg_dir, &target, token.as_deref())?;
             let stream = connect_and_auth(ConnectOptions {
                 config_dir: cfg_dir,
@@ -238,8 +338,9 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
                 client_name: "portico-cli",
             })
             .await?;
-            let (local_addr, bridge_task) = start_local_usbip_bridge(stream, &bus_id).await?;
+            let (local_addr, mut bridge_task) = start_local_usbip_bridge(stream, &bus_id).await?;
             println!("Local USB/IP bridge for {bus_id} listening on {local_addr}");
+            let mut vhci_port = None;
             if proxy_only {
                 println!(
                     "Proxy-only mode: run `usbip --tcp-port {} attach -r 127.0.0.1 -b {bus_id}`",
@@ -247,31 +348,88 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
                 );
             } else {
                 run_usbip_attach_command("usbip", local_addr.port(), &bus_id).await?;
+                vhci_port = Command::new("usbip").arg("port").output().await.ok()
+                    .and_then(|o| parse_vhci_port(&String::from_utf8_lossy(&o.stdout), &bus_id));
                 println!("Attached {bus_id} via vhci-hcd. Press Ctrl-C to disconnect.");
             }
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                res = bridge_task => {
-                    if let Ok(Err(e)) = res {
-                        return Err(e.into());
+            if daemon_child {
+                save_attachment(cfg_dir, &Attachment {
+                    bus_id: bus_id.clone(),
+                    target: target.clone(),
+                    pid: std::process::id(),
+                    vhci_port,
+                    started_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    log_path: log_path(cfg_dir, &bus_id).display().to_string(),
+                    mount_points: vec![],
+                })?;
+                println!("Background session recorded. Stop with `portico stop {bus_id}`.");
+            }
+            if !proxy_only {
+                spawn_mount_watcher(
+                    before_mounts,
+                    if daemon_child { Some((cfg_dir.clone(), bus_id.clone())) } else { None },
+                );
+            }
+            let result: Result<(), Box<dyn std::error::Error>> = tokio::select! {
+                _ = tokio::signal::ctrl_c() => { Ok(()) }
+                res = &mut bridge_task => {
+                    match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.into()),
+                        Err(e) => Err(format!("bridge task panicked: {e}").into()),
+                    }
+                }
+            };
+            // Cleanup: drop the session record and free the kernel port.
+            if daemon_child || vhci_port.is_some() {
+                let _ = remove_attachment(cfg_dir, &bus_id);
+                if let Some(p) = vhci_port {
+                    if let Err(e) = run_usbip_detach(p).await {
+                        eprintln!("warning: could not detach vhci port {p}: {e}");
                     }
                 }
             }
+            result?;
+        }
+        Commands::Status => {
+            let list = load_attachments(cfg_dir);
+            if list.is_empty() {
+                println!("No background attachments.");
+            } else {
+                for a in list {
+                    let state = if pid_alive(a.pid) { "running" } else { "stale" };
+                    let mounts = if a.mount_points.is_empty() {
+                        "-".to_string()
+                    } else {
+                        a.mount_points.join(", ")
+                    };
+                    println!("{}\t{}\tpid={}\tvhci={:?}\t{}\t{}\tmounts={}",
+                        a.bus_id, a.target, a.pid, a.vhci_port, state, a.log_path, mounts);
+                }
+            }
+        }
+        Commands::Stop { bus_id } => {
+            let Some(active) = find_active(cfg_dir, &bus_id) else {
+                return Err(format!("no active background attachment for {bus_id}").into());
+            };
+            #[cfg(unix)]
+            {
+                // SIGINT is caught by the daemon's ctrl_c handler; it cleans up its own record.
+                unsafe { libc::kill(active.pid as i32, libc::SIGINT); }
+                for _ in 0..40 {
+                    if !pid_alive(active.pid) { break; }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if pid_alive(active.pid) {
+                    return Err(format!("process {} did not stop; kill it manually", active.pid).into());
+                }
+            }
+            let _ = remove_attachment(cfg_dir, &bus_id);
+            println!("Stopped {bus_id}");
         }
         Commands::Detach { port } => {
-            let out = Command::new("usbip")
-                .arg("detach")
-                .arg("-p")
-                .arg(port.to_string())
-                .output()
-                .await?;
-            if !out.status.success() {
-                return Err(format!(
-                    "usbip detach failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )
-                .into());
-            }
+            use portico_cli::bridge::run_usbip_detach;
+            run_usbip_detach(port).await?;
             println!("Detached vhci port {port}");
         }
         Commands::Listen {

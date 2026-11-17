@@ -2,6 +2,7 @@ pub mod bridge;
 pub mod discover;
 pub mod reverse;
 pub mod serve;
+pub mod session;
 pub mod transport;
 
 use thiserror::Error;
