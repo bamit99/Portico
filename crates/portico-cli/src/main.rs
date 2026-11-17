@@ -3,7 +3,7 @@ use portico_cli::bridge::{run_usbip_attach_command, start_local_usbip_bridge};
 use portico_cli::discover::discover_servers;
 use portico_cli::reverse::ReverseListener;
 use portico_cli::serve::{start_host_daemon, ServeOptions};
-use portico_cli::transport::{cmd_list, cmd_trust, connect_and_auth, ConnectOptions};
+use portico_cli::transport::{cmd_list, cmd_pair, cmd_trust, connect_and_auth, resolve_token, ConnectOptions};
 use portico_proto::identity::format_short_fingerprint;
 use portico_proto::{DEFAULT_DISCOVERY_PORT, DEFAULT_PORT};
 use portico_relay::RelayServer;
@@ -37,11 +37,19 @@ enum Commands {
         target: String,
         fingerprint: String,
     },
+    /// Pair with a Portico server: interactive TOFU confirm, pin the certificate and store the claim token
+    Pair {
+        target: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(short = 'y', long)]
+        assume_yes: bool,
+    },
     /// List shared USB devices on a Portico server
     List {
         target: String,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long)]
         trust: Option<String>,
         #[arg(long)]
@@ -52,7 +60,7 @@ enum Commands {
         target: String,
         bus_id: String,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long)]
         trust: Option<String>,
         #[arg(long)]
@@ -70,7 +78,7 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:37425")]
         bind: SocketAddr,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long = "allow-server", required = true)]
         allow_servers: Vec<String>,
         #[arg(long = "attach-bus")]
@@ -168,12 +176,25 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
             cmd_trust(cfg_dir, &target, &fingerprint)?;
             println!("Pinned {target}");
         }
+        Commands::Pair {
+            target,
+            token,
+            assume_yes,
+        } => {
+            cmd_pair(cfg_dir, &target, token.as_deref(), assume_yes, |_| {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap_or(0);
+                line.trim().eq_ignore_ascii_case("y")
+            })
+            .await?;
+        }
         Commands::List {
             target,
             token,
             trust,
             insecure_lan_plaintext,
         } => {
+            let token = resolve_token(cfg_dir, &target, token.as_deref())?;
             let devs = cmd_list(ConnectOptions {
                 config_dir: cfg_dir,
                 target: &target,
@@ -207,6 +228,7 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
             insecure_lan_plaintext,
             proxy_only,
         } => {
+            let token = resolve_token(cfg_dir, &target, token.as_deref())?;
             let stream = connect_and_auth(ConnectOptions {
                 config_dir: cfg_dir,
                 target: &target,
@@ -259,6 +281,7 @@ async fn run(cmd: Commands, cfg_dir: &PathBuf) -> Result<(), Box<dyn std::error:
             attach_buses,
             proxy_only,
         } => {
+            let token = token.ok_or_else(|| "no claim token — pass --token or store it via pair".to_string())?;
             let id = ReverseListener::load_or_create_identity(cfg_dir)?;
             let fp = id.fingerprint_hex();
             println!("Desktop reverse-listener fingerprint: {fp}");

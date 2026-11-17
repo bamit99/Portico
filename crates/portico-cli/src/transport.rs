@@ -3,7 +3,8 @@ use portico_proto::frame::{
     read_frame, write_frame, AuthKind, DeviceSummary, Frame, HelloStatus, CAP_USBIP_V1,
     PROTOCOL_VERSION_V0,
 };
-use portico_proto::identity::normalize_fingerprint;
+use portico_proto::identity::{format_short_fingerprint, normalize_fingerprint};
+use std::collections::BTreeMap;
 use portico_proto::relay_proto::{parse_relay_uri, RelayFrame};
 use portico_proto::tls::{
     build_client_tls_config, configure_tunnel_tcp, is_lan_or_loopback_ip, CertCheckPolicy,
@@ -284,5 +285,133 @@ pub fn cmd_trust(config_dir: &Path, target: &str, fp_hex: &str) -> Result<(), Cl
     let mut kh = KnownHosts::load(&path)?;
     kh.pin(ep.pin_key(), fp_hex)?;
     kh.save_atomic(&path)?;
+    Ok(())
+}
+
+fn tokens_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("tokens.json")
+}
+
+fn load_token_store(config_dir: &Path) -> Result<Option<BTreeMap<String, String>>, CliError> {
+    let path = tokens_path(config_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read(&path)?;
+    let map: BTreeMap<String, String> =
+        serde_json::from_slice(&data).map_err(|e| CliError::Remote(format!("tokens json: {e}")))?;
+    Ok(Some(map))
+}
+
+fn store_token(config_dir: &Path, pin_key: &str, token: &str) -> Result<(), CliError> {
+    let path = tokens_path(config_dir);
+    let mut map = load_token_store(config_dir)?.unwrap_or_default();
+    map.insert(pin_key.to_string(), token.to_string());
+    let json = serde_json::to_vec_pretty(&map)
+        .map_err(|e| CliError::Remote(format!("tokens serialize: {e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+pub fn resolve_token(
+    config_dir: &Path,
+    target: &str,
+    cli_token: Option<&str>,
+) -> Result<String, CliError> {
+    if let Some(t) = cli_token {
+        return Ok(t.to_string());
+    }
+    let ep = TargetEndpoint::parse(target)?;
+    load_token_store(config_dir)?
+        .and_then(|m| m.get(ep.pin_key()).cloned())
+        .ok_or_else(|| {
+            CliError::Remote("no claim token — pass --token or run `portico pair` first".into())
+        })
+}
+
+/// SSH-style pairing: complete the TLS handshake, show the observed fingerprint
+/// (full + short form), confirm on the terminal, pin it, and store the claim token.
+pub async fn cmd_pair(
+    config_dir: &Path,
+    target: &str,
+    token: Option<&str>,
+    assume_yes: bool,
+    confirm: impl FnOnce(&str) -> bool,
+) -> Result<(), CliError> {
+    let ep = TargetEndpoint::parse(target)?;
+    let kh_path = known_hosts_path(config_dir);
+    let kh = KnownHosts::load(&kh_path)?;
+    let pin_key = ep.pin_key().to_string();
+    let existing_pin = kh
+        .entries
+        .get(&pin_key)
+        .map(|raw| normalize_fingerprint(raw).unwrap_or_else(|_| raw.to_lowercase()));
+
+    let (tls_cfg, observed) = build_client_tls_config(
+        None,
+        CertCheckPolicy::PinnedOrFirstUse {
+            expected_fp: existing_pin.clone(),
+            trust_first_use: existing_pin.is_none(),
+        },
+    )?;
+
+    let tcp = open_raw_tcp(&ep).await?;
+    let sni_host = match &ep {
+        TargetEndpoint::Direct(addr) => extract_host_for_sni(addr),
+        TargetEndpoint::Relay { .. } => "portico-node".to_string(),
+    };
+    let server_name = sni_host
+        .try_into()
+        .map_err(|_| CliError::Remote("invalid SNI hostname".into()))?;
+    let connector = TlsConnector::from(tls_cfg);
+    let tls = match connector.connect(server_name, tcp).await {
+        Ok(tls) => tls,
+        Err(_) => {
+            if let (Some(expected), Some(actual)) = (existing_pin.clone(), observed.get()) {
+                if expected != actual {
+                    return Err(CliError::CertPinMismatch {
+                        endpoint: pin_key,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            return Err(CliError::Remote("TLS handshake failed".into()));
+        }
+    };
+    let fp = observed
+        .get()
+        .ok_or_else(|| CliError::Remote("missing peer certificate".into()))?;
+    drop(tls);
+
+    if let Some(expected) = existing_pin {
+        println!("Already paired: {pin_key}");
+        println!("Fingerprint (SHA-256): {expected}");
+        if let Some(tok) = token {
+            store_token(config_dir, &pin_key, tok)?;
+            println!("Stored claim token.");
+        }
+        return Ok(());
+    }
+
+    println!("Observed fingerprint (SHA-256): {fp}");
+    println!("Short: {}", format_short_fingerprint(&fp));
+    println!("Compare against the phone GUI badge, then confirm to pin.");
+    println!("Confirm? [y/N]");
+    if assume_yes || confirm(&fp) {
+        let mut kh = kh;
+        kh.pin(&pin_key, &fp)?;
+        kh.save_atomic(&kh_path)?;
+        println!("Pinned {pin_key}");
+        if let Some(tok) = token {
+            store_token(config_dir, &pin_key, tok)?;
+            println!("Stored claim token.");
+        }
+    } else {
+        println!("Pairing declined; not pinned.");
+    }
     Ok(())
 }

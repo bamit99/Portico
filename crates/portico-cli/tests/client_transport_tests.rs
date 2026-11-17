@@ -1,6 +1,7 @@
-use portico_cli::transport::{cmd_list, cmd_trust, ConnectOptions, TargetEndpoint};
+use portico_cli::transport::{cmd_list, cmd_pair, cmd_trust, resolve_token, ConnectOptions, TargetEndpoint};
 use portico_cli::CliError;
 use portico_core::daemon::PorticoDaemon;
+use portico_proto::tofu::KnownHosts;
 use portico_relay::RelayServer;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -184,5 +185,88 @@ async fn tofu_pin_mismatch_public_plaintext_rejection_and_relay_list() {
     .is_err());
 
     relay_task.abort();
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn pair_confirm_declines_then_pins_stores_token_and_list_uses_store() {
+    let daemon_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let sock = daemon_dir.path().join("portico-ctrl.sock");
+
+    let daemon = PorticoDaemon::start_with_bind_overrides(
+        daemon_dir.path().to_path_buf(),
+        sock,
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+    )
+    .await
+    .unwrap();
+    let h = daemon.handle();
+    h.state
+        .registry
+        .register_usb_device(
+            make_sim_cdc("1-1"),
+            "SanDisk".into(),
+            "Ultra".into(),
+            "S1".into(),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.exec_command("START_SERVER").await, "OK");
+
+    let tcp_addr = h.network.bound_tcp_addr().await.unwrap().to_string();
+    let token = h
+        .exec_command("GET_TOKEN")
+        .await
+        .strip_prefix("OK ")
+        .unwrap()
+        .to_string();
+    let fp = h.state.identity.read().await.fingerprint_hex();
+
+    // 1. Declined confirm: nothing is pinned
+    cmd_pair(cli_dir.path(), &tcp_addr, Some(&token), false, |_| false)
+        .await
+        .unwrap();
+    assert!(!cli_dir.path().join("known_hosts.json").exists());
+
+    // 2. Confirmed pairing: pin + stored token
+    cmd_pair(cli_dir.path(), &tcp_addr, Some(&token), false, |_| true)
+        .await
+        .unwrap();
+    let kh = KnownHosts::load(&cli_dir.path().join("known_hosts.json")).unwrap();
+    assert_eq!(kh.entries.get(&tcp_addr).map(|s| s.as_str()), Some(fp.as_str()));
+    assert_eq!(
+        resolve_token(cli_dir.path(), &tcp_addr, None).unwrap(),
+        token
+    );
+
+    // 3. list works with the stored token (no --token flag)
+    let stored = resolve_token(cli_dir.path(), &tcp_addr, None).unwrap();
+    let list = cmd_list(ConnectOptions {
+        config_dir: cli_dir.path(),
+        target: &tcp_addr,
+        token: &stored,
+        trust_fp: None,
+        insecure_lan_plaintext: false,
+        client_name: "cli",
+    })
+    .await
+    .unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].bus_id, "1-1");
+
+    // 4. Re-pair on already-paired endpoint is a no-op (confirm not called)
+    cmd_pair(cli_dir.path(), &tcp_addr, None, true, |_| {
+        unreachable!("no prompt when already paired")
+    })
+    .await
+    .unwrap();
+
+    // 5. Unknown endpoint with no pin and no stored token: crisp error
+    let err = resolve_token(cli_dir.path(), "192.168.99.99:37420", None).unwrap_err();
+    assert!(format!("{err}").contains("no claim token"));
+
     daemon.shutdown().await;
 }
