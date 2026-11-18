@@ -1,109 +1,86 @@
-# Portico — prompt for the clean-room clone
+# Portico
 
-**Working name:** Portico (chosen 2026-11-16; alternates if we rename later: Tetherio, NetLanyard, Bridgely — folder renamed to `Portico/`, docs updated)
+**Share the USB devices plugged into your phone with computers on your network — and let machines borrow each other's USB devices too.**
 
----
+Plug a pendrive into your Android phone, and it shows up as a local disk on your Linux desktop over Wi-Fi. No cloud, no cable, no app on the receiving machine beyond one small CLI. Portico is a from-scratch, open-source USB-over-network tool: an Android app acts as the server, and lightweight desktop clients attach to it using the standard Linux USB/IP stack.
 
-## Using the desktop CLI (Linux)
+## How it works
 
-**Platform support:** the desktop CLI is Linux-only today. The device-attach path depends on the `vhci-hcd` kernel module and the `usbip` CLI, which macOS does not have; `session.rs` also reads `/proc/self/mountinfo`. The platform-independent parts (protocol, TLS/TOFU, `pair`, `discover`, `list`, `trust`, `relay`, `identity`) would build and run on macOS, but `attach`/`detach`/`status`/`stop` need a clean-room DriverKit client — the same signing/notarization hurdle noted for Windows — and are out of v1 scope. Android (phone/server side) is unaffected.
+- The **Android app** runs a userspace USB/IP server (libusb-based — no root needed). Devices plugged into the phone are shared over TCP once you grant permission, shown in a Material 3 GUI with a claim token and fingerprint badge.
+- The **desktop client** (`portico` CLI, Linux) discovers the phone, verifies its TLS certificate on first contact (TOFU pinning), and uses a per-endpoint **claim token** shown in the app to attach devices. On attach, the kernel's `vhci-hcd` module mounts the remote device as if it were plugged in locally — the OS then treats it like any USB disk.
 
-Install the binary to a PATH directory (e.g. `~/bin/portico`). All commands work from anywhere.
+Traffic runs on your LAN over TLS; discovery uses a UDP broadcast (TCP `37420`, UDP `37421` by default).
 
-**One-time setup — passwordless sudo for USB/IP.** `usbip attach`/`detach` write to `/sys/devices/platform/vhci_hcd.*/`, which needs root. In non-background mode the CLI asks sudo on demand; for background mode a NOPASSWD rule is required (a detached process has no terminal to prompt). Install it once:
+## Features
+
+- **Auto-share on plug-in** — every attached device is shared by default; ignore-list keeps exclusions persistent (`vid/pid` based)
+- **Per-device permission grants** — remembered across reboots
+- **Start on boot**, keep-network-awake and keep-device-awake toggles
+- **NAT relay/discovery service** for phones behind a different network segment
+- **Foreground/background attach** on desktop; `status`/`stop` to manage detached sessions
+- Full feature checklist in [FEATURES.md](FEATURES.md); architecture decisions in [DESIGN.md](DESIGN.md)
+
+## Requirements
+
+- **Server:** an Android phone running the Portico app
+- **Client:** Linux with the `vhci-hcd` kernel module (macOS/Windows clients are future work — see roadmap in [CLONE-PROMPT.md](CLONE-PROMPT.md))
+
+## Quick start — phone side
+
+1. Install the app and open it.
+2. Allow the permission prompt for each device you plug in (remembered afterwards).
+3. Note the **claim token** and **fingerprint badge** shown in the app.
+
+## Quick start — desktop (Linux)
+
+Install the `portico` binary (e.g. `cargo build --release`, then copy `target/release/portico` to a PATH directory).
+
+**One-time setup — passwordless sudo for USB/IP.** `usbip attach`/`detach` write to `/sys/devices/platform/vhci_hcd.*/`, which needs root. For background mode, install a NOPASSWD rule once:
 
 ```
 sudo visudo -f /etc/sudoers.d/portico
 ```
 
-Add this line (replace `amit` with your username), save, then verify with `sudo -l -U amit`:
-
 ```
-amit ALL=(root) NOPASSWD: /usr/bin/usbip *
+<your-username> ALL=(root) NOPASSWD: /usr/bin/usbip *
 ```
 
-Also load the kernel module once per boot:
+Load the kernel module once per boot:
 
 ```
 sudo modprobe vhci-hcd
 echo vhci_hcd | sudo tee /etc/modules-load.d/portico.conf   # persist across reboots
 ```
 
-**Normal flow.** The phone's UDP discovery broadcast is blocked on many Wi-Fi APs; target the phone IP directly. TCP port 37420 is the service, UDP 37421 is discovery (discovery just reports the TCP port):
+**Attach a device:**
 
 ```
-portico discover --target 192.168.0.181:37421     # optional — find the TCP port
-portico pair 192.168.0.181                          # TOFU: compare badge, answer y; pins cert + stores token
-portico list 192.168.0.181:37420                   # first column = bus ID (no --token needed after pair)
+portico discover --target <phone-ip>:37421     # optional — find the TCP port
+portico pair <phone-ip>                        # TOFU: compare badge, answer y
+portico list <phone-ip>:37420 --token <your-claim-token>
+portico attach <phone-ip>:37420 <bus-id> --background
+portico status                                 # active background attachments + mount paths
+portico stop <bus-id>                          # detach one device
 ```
 
-Copy the **bus ID** (first column of `portico list`) into `attach` — do not guess it from the Android UI. It is a phone-side kernel port address (`1-2`, `2-1`, …) that changes when the disk is replugged or the phone reboots. `list` always shows what is currently shared; `in_use` means another client holds it.
+Notes:
 
-```
-portico attach 192.168.0.181:37420 1-2                       # foreground; Ctrl-C to disconnect
-portico attach 192.168.0.181:37420 1-2 --background           # detached; prompt returns immediately
-portico status                                                # list active background attachments
-portico stop 1-2                                              # stop one; frees its vhci port
-```
+- The **bus ID** is the first column of `portico list` — it changes whenever the disk is replugged or the phone reboots, so copy it fresh. `in_use` means another client holds the device.
+- After attach, `udisksd` auto-mounts the disk under `/run/media/<user>/<label>`; the CLI prints the mount path.
+- Fingerprints are case-insensitive dash-stripped hex; claim tokens are uppercase Crockford base32 — copy-paste, never retype.
+- The store lives in `~/.config/portico/` (`known_hosts.json` for TOFU pins, `tokens.json` for claim tokens); background session records live in `$XDG_RUNTIME_DIR/portico/` (tmpfs).
 
-After a successful attach the kernel enumerates the disk and `udisksd` auto-mounts it under `/run/media/<user>/<label>`; the CLI prints the mount path (or a fallback `lsblk`/`udisksctl` hint if nothing auto-mounts), and `portico status` shows it in the `mounts=` column for background sessions. Fingerprints are case-insensitive dash-stripped hex (64 chars) — paste the phone badge into `portico trust`; claim tokens are uppercase Crockford base32, case-sensitive — copy-paste, never retype.
+## Security
 
-**Pin/token store:** `~/.config/portico/known_hosts.json` (TOFU pins) and `tokens.json` (per-endpoint claim tokens). Background session records live in `$XDG_RUNTIME_DIR/portico/` (tmpfs — cleared on reboot); detach cleans them up.
+TLS with trust-on-first-use certificate pinning, per-endpoint claim tokens, and per-device grants on the phone side. Regenerate a claim token from the app at any time to invalidate the old one.
 
----
+## Project docs
 
-## The prompt to execute
+- [FEATURES.md](FEATURES.md) — feature specification
+- [DESIGN.md](DESIGN.md) — design notes
+- [PROGRESS.md](PROGRESS.md) — development log
+- [CLONE-PROMPT.md](CLONE-PROMPT.md) — the clean-room build briefing used during development (archival)
 
-> Use the `brainstorming` skill first — this is new creative design work. Then follow §Process below; use the `writing-plans`, `subagent-driven-development` (or `executing-plans`), `test-driven-development`, `requesting-code-review`/`receiving-code-review`, and `verification-before-completion` skills at the marked points.
+## Status
 
-**Goal.** Build a from-scratch clone of a USB-over-the-network server with a brand-new UI, per `FEATURES.md`. Do **not** look at, reference, port, or "consult" the original application whose feature list this is — implement purely from this spec. Pick your own names, icons, layout, wording and wire protocol.
-
-**Platform:** Android (phone/server side) + desktop clients that can consume the same server.
-
-**Tech stack (decided, don't re-litigate in brainstorm unless blocked):**
-- **Core daemon engine:** Rust — single crate, USB hotplug/auto-share, network service.
-- **Android GUI:** Kotlin + Jetpack Compose (Material 3), app wraps the Rust core (via FFI or a thin local-socket control channel) or pure Kotlin + Rust binary; simplest build that works.
-- **Desktop clients:** Rust core reused; CLI first (`portico` command-line client), GUI later (Tauri or GTK, decide at plan time) — desktop scope may be a thin client for now (list/claim devices over the wire).
-- **Licensing: N/A — free app.** No license format, keys, billing, or purchase flow for now (no Play Billing). Leave a hook in the architecture so a paid tier can be added later without rework.
-- **Protocol:** our own (versioned). Keep a compatibility note so the plan can decide later if we ever expose a compat mode — not in v1 scope.
-
-**Deliverable of the whole run:** working Android APK on the phone + desktop client on this machine, each feature per `FEATURES.md` verified end-to-end (plug a device → see it shared → client uses it) — not just unit tests.
-
-## §Process (step by step)
-
-1. `$brainstorming` — shape the design: product naming, UI design system, wire protocol, storage, logging. Write `DESIGN.md`.
-2. `$writing-plans` — one plan file per subsystem in `plans/`, each task ≤ ~20 min, each with its test plan.
-3. For each plan task: `$test-driven-development` (RED → GREEN → `code-review`) → `$requesting-code-review` when the task's tests pass → fix `$receiving-code-review`.
-4. Integrate per `$subagent-driven-development` (or `$executing-plans`) as we execute tasks in the current session; run `$verification-before-completion` before claiming any feature complete.
-5. Milestones M1 core, M2 Android GUI, M3 desktop client, M4 UI polish; each with runnable acceptance on the real phone (`OnePlus 12R`) and a real device plugged in.
-
-Definition of done for every feature: implemented → tests green → reviewed → demoed on device/desktop → logged in `PROGRESS.md`.
-
----
-
-## Appendix: pointers to existing pieces (what's legal to use)
-
-**Use directly (MIT/Apache)**
-- https://github.com/jiegec/usbip — Rust USB/IP server lib (MIT) — the core plugs into this
-- https://github.com/microsoft/usbipd-win — Windows USB/IP server + GUI v5 (MIT)
-- https://github.com/beriberikix/usbipd-mac — macOS server (MIT)
-- https://github.com/libusb/libusb — LGPL (dynamic-link only, as used from Rust wrapper)
-
-**Protocol spec (documented — no new protocol work)**
-- https://github.com/torvalds/linux/blob/master/Documentation/usb/usbip_protocol.rst
-
-**GPL reference (look, don't link — clean-room boundary)**
-- https://github.com/vadimgrn/usbip-win2 — Windows client, WHQL drivers
-- Linux kernel `vhci-hcd` (in-kernel client) + `usbip`/`usbipd` tools
-- https://github.com/mwmakeiyong/Network-USB · https://github.com/suifei/usbctl · https://github.com/Penderrin-Projects/ZeroHub · https://github.com/otti83/airusb-hub · https://github.com/matumi-software/koppel · https://github.com/yunsmall/usbipdcpp
-
-**Android glue**
-- libusb-on-Android (userspace claim, per-device intent grants — root-free path proven by the original app)
-- Concrete recipe (verified vs libusb official Android README + rusb upstream): Kotlin `UsbManager.requestPermission` → `UsbDeviceConnection.getFileDescriptor()` → pass fd to Rust over JNI/JNA → `LIBUSB_OPTION_NO_DEVICE_DISCOVERY` + `libusb_wrap_sys_device` (= `rusb` `Context::open_device_with_fd`); Android persists device grants across reboots.
-- **License sweep (2026-11-16): every public Android USB/IP server is GPL-3.0 or unlicensed — none MIT/Apache.** All are look-don't-link references: cgutman/USBIPServerForAndroid (GPL-3, Java, fd-injection USBIP over localhost:3240), lleokaganov/wsusb (GPL-3, same + encrypted WebSocket relay — design reference for the relay feature), yunsmall/Android-Usbipdcpp (GPL-3 Kotlin; core lib usbipdcpp is LGPLv3 — dynamic-linking LGPL ≠ GPL infection, kept out by choice at stricter-boundary), techphenom/USBIP-Server-Android (GPL-3, C, Android 11+), forensix/libusbip (no license, dead).
-- USBIP protocol note: kernel `usbip_host` module does not exist on Android → the server must be fully userspace (libusb + USBIP protocol), same architecture as usbipd-win.
-
-**License = ours (no pointer — write new)**
-- Android app UI, thin Rust daemon glue, desktop CLI, LAN discovery
-- macOS *client* driver (DriverKit) — only hard new landmine; v1 skip
-
+v1 scope: Android server + Linux desktop CLI. Windows (usbipd-style) and macOS (DriverKit) clients and a desktop GUI are future directions.
